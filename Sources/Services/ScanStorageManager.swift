@@ -22,6 +22,7 @@ public actor ScanStorageManager {
         id: UUID = UUID(),
         name: String,
         createdAt: Date = Date(),
+        environmentMode: EnvironmentMode = .clinicalLab,
         geometry: BakedRoomGeometry,
         equipment: [TrackedEquipment3D]
     ) throws -> SavedRoomScanMetadata {
@@ -34,6 +35,7 @@ public actor ScanStorageManager {
             id: id,
             name: resolvedName,
             createdAt: createdAt,
+            environmentMode: environmentMode,
             equipment: equipment,
             boundsMin: geometry.boundsMin,
             boundsMax: geometry.boundsMax,

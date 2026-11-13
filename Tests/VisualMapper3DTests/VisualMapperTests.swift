@@ -845,4 +845,175 @@ final class VisualMapperTests: XCTestCase {
         XCTAssertFalse(controller.isDollhouseOrbitEnabled)
         XCTAssertFalse(controller.isVirtualCameraActive)
     }
+
+    // MARK: - Deferred 3D NMS, Memory Pruning & Knowledge Service Tests
+
+    @MainActor
+    func testDeferredBakeClassAgnostic3DNMSAndLabelResolution() throws {
+        let manager = EquipmentClusteringManager()
+
+        // Simulate conflicting YOLO detections around one large lounge wall display (> 0.85 m)
+        manager.recordObservationCandidate(
+            label: "television",
+            confidence: 0.85,
+            worldPosition: simd_float3(0.0, 1.2, -2.0),
+            boundingBox3DExtent: simd_float3(1.20, 0.70, 0.12)
+        )
+        manager.recordObservationCandidate(
+            label: "whiteboard",
+            confidence: 0.70,
+            worldPosition: simd_float3(0.22, 1.24, -1.96),
+            boundingBox3DExtent: simd_float3(1.12, 0.68, 0.12)
+        )
+        manager.recordObservationCandidate(
+            label: "monitor",
+            confidence: 0.60,
+            worldPosition: simd_float3(-0.18, 1.18, -2.04),
+            boundingBox3DExtent: simd_float3(1.10, 0.65, 0.12)
+        )
+        manager.recordObservationCandidate(
+            label: "television",
+            confidence: 0.82,
+            worldPosition: simd_float3(0.08, 1.21, -2.01),
+            boundingBox3DExtent: simd_float3(1.18, 0.69, 0.12)
+        )
+
+        // Zero pins are instantiated prematurely during live scanning.
+        XCTAssertTrue(manager.trackedEquipment.isEmpty)
+        XCTAssertEqual(manager.observationCandidates.count, 4)
+
+        let consolidated = manager.consolidateObservations()
+        XCTAssertEqual(consolidated.count, 1)
+        let pin = try XCTUnwrap(consolidated.first)
+        XCTAssertEqual(pin.label, "television")
+        XCTAssertEqual(pin.observationCount, 4)
+        XCTAssertEqual(Set(pin.labelVotes.keys), Set(["television", "whiteboard", "monitor"]))
+        XCTAssertGreaterThan(pin.averageConfidence, 0.70)
+    }
+
+    @MainActor
+    func testDeferredBakeGateDiscardsTransientLowHitAndLowConfidenceClusters() throws {
+        let manager = EquipmentClusteringManager()
+
+        // 2 hits of bottle -> below minimum 3 hits -> discarded
+        for offset in [Float(0.0), Float(0.03)] {
+            manager.recordObservationCandidate(
+                label: "bottle",
+                confidence: 0.90,
+                worldPosition: simd_float3(2.0 + offset, 0.8, -1.0)
+            )
+        }
+
+        // 4 hits of chair at mean confidence 0.25 -> below 0.40 gate -> discarded
+        for offset in [Float(0.0), 0.05, -0.04, 0.02] {
+            manager.recordObservationCandidate(
+                label: "chair",
+                confidence: 0.25,
+                worldPosition: simd_float3(-2.0 + offset, 0.5, -1.0)
+            )
+        }
+
+        // 3 strong hits of desktop monitor -> survives cleanly
+        for offset in [Float(0.0), 0.03, -0.02] {
+            manager.recordObservationCandidate(
+                label: "television",
+                confidence: 0.85,
+                worldPosition: simd_float3(0.0 + offset, 1.0, -1.5),
+                boundingBox3DExtent: simd_float3(0.58, 0.36, 0.10)
+            )
+        }
+
+        let results = manager.consolidateObservations()
+        XCTAssertEqual(results.count, 1)
+        let surviving = try XCTUnwrap(results.first)
+        XCTAssertEqual(surviving.label, "monitor")
+        XCTAssertEqual(surviving.observationCount, 3)
+    }
+
+    @MainActor
+    func testDeferredBakeSmallItemsOnDeskStayDistinctAndResolveDeskContext() throws {
+        let manager = EquipmentClusteringManager()
+
+        // 3 hits for desk/table center at y = 0.72
+        for dx in [Float(0.0), 0.04, -0.03] {
+            manager.recordObservationCandidate(
+                label: "table",
+                confidence: 0.80,
+                worldPosition: simd_float3(0.0 + dx, 0.72, -1.5),
+                boundingBox3DExtent: simd_float3(1.4, 0.75, 0.75)
+            )
+        }
+
+        // 3 hits for cup 0.42 m away from desk center on top of desk (y = 0.90) -> must NOT swallow into desk
+        for dx in [Float(0.0), 0.02, -0.01] {
+            manager.recordObservationCandidate(
+                label: "cup",
+                confidence: 0.88,
+                worldPosition: simd_float3(0.42 + dx, 0.90, -1.5),
+                boundingBox3DExtent: simd_float3(0.09, 0.11, 0.09)
+            )
+        }
+
+        // 3 hits for laptop on top of desk -> turns "table" into "desk"
+        for dx in [Float(0.0), 0.02, -0.02] {
+            manager.recordObservationCandidate(
+                label: "laptop",
+                confidence: 0.92,
+                worldPosition: simd_float3(-0.35 + dx, 0.90, -1.45),
+                boundingBox3DExtent: simd_float3(0.35, 0.24, 0.25)
+            )
+        }
+
+        let results = manager.consolidateObservations()
+        let labels = Set(results.map(\.label))
+        XCTAssertEqual(results.count, 3)
+        XCTAssertEqual(labels, Set(["desk", "cup", "laptop"]))
+    }
+
+    func testHybridEquipmentKnowledgeServiceProfilesAcrossModes() async throws {
+        let service = HybridEquipmentKnowledgeService()
+
+        let phoropter = TrackedEquipment3D(
+            label: "phoropter",
+            worldPosition: simd_float3(0.5, 1.2, -1.4),
+            observationCount: 5,
+            averageConfidence: 0.91
+        )
+        let clinicalProfile = try await service.fetchContext(for: phoropter, mode: .clinicalLab)
+        XCTAssertEqual(clinicalProfile.source, .offlineKnowledgeBase)
+        XCTAssertTrue(clinicalProfile.displayName.contains("Phoropter"))
+        XCTAssertTrue(clinicalProfile.assetTagID.hasPrefix("AC-PHR-"))
+        XCTAssertTrue(clinicalProfile.fhirDeviceCode.contains("snomed"))
+        XCTAssertTrue(clinicalProfile.udibaBarcode.contains("(01)"))
+
+        let tv = TrackedEquipment3D(
+            label: "monitor",
+            worldPosition: simd_float3(0.0, 1.0, -1.0),
+            observationCount: 4,
+            averageConfidence: 0.88
+        )
+        let householdProfile = try await service.fetchContext(for: tv, mode: .householdTest)
+        XCTAssertEqual(householdProfile.category, "Desktop Display Monitor")
+        XCTAssertFalse(householdProfile.operationalGuidelines.isEmpty)
+        XCTAssertFalse(householdProfile.maintenanceOrSafetyNotes.isEmpty)
+    }
+
+    func testARSessionAnchorPruningKeepsNearestAnchors() {
+        let nearID = UUID()
+        let midID = UUID()
+        let farID = UUID()
+        let entries: [(id: UUID, position: simd_float3)] = [
+            (farID, simd_float3(12.0, 0.0, 0.0)),
+            (nearID, simd_float3(0.8, 0.0, 0.0)),
+            (midID, simd_float3(3.2, 0.0, 0.0))
+        ]
+
+        let retained = ARSessionManager.idsToRetain(
+            from: entries,
+            relativeTo: .zero,
+            maxRetained: 2
+        )
+        XCTAssertEqual(retained, Set([nearID, midID]))
+        XCTAssertFalse(retained.contains(farID))
+    }
 }

@@ -105,17 +105,21 @@ public final class ARSessionManager: NSObject, ObservableObject {
     public private(set) var currentCameraTransform: simd_float4x4 = matrix_identity_float4x4
     @Published public private(set) var currentCameraPosition: simd_float3 = .zero
     @Published public private(set) var trackingStatusMessage: String = "Ready to scan"
-    @Published public private(set) var meshRevision: UInt64 = 0
+    @Published public private(set) var trackedMeshAnchorCount: Int = 0
     @Published public private(set) var isInferenceInFlight: Bool = false
     @Published public private(set) var sessionRunGeneration: UInt64 = 0
+
+    /// Maximum `ARMeshAnchor` count retained in RAM before distant anchors are pruned to avoid Jetsam OOM.
+    public static let maxRetainedMeshAnchors: Int = 180
+    /// Anchor cap applied immediately when iOS dispatches a low-memory warning.
+    public static let memoryWarningMeshAnchorCap: Int = 80
 
     public let session: ARSession
     private var throttlePolicy: KeyframeThrottlePolicy
     private var lastPublishedPosition: simd_float3 = .zero
 
     private var meshAnchorsByID: [UUID: ARMeshAnchor] = [:]
-    private var pendingUpsertedMeshIDs: Set<UUID> = []
-    private var pendingRemovedMeshIDs: Set<UUID> = []
+    private var memoryWarningCancellable: AnyCancellable?
 
     private var detector: (any EquipmentDetecting)?
     private let projector: SpatialProjector
@@ -140,6 +144,15 @@ public final class ARSessionManager: NSObject, ObservableObject {
         super.init()
         self.session.delegate = self
         self.session.delegateQueue = .main
+
+        self.memoryWarningCancellable = NotificationCenter.default
+            .publisher(for: UIApplication.didReceiveMemoryWarningNotification)
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] _ in
+                Task { @MainActor [weak self] in
+                    self?.handleMemoryWarning()
+                }
+            }
     }
 
     /// Connects the detection, 3D raycast projection, and clustering pipeline.
@@ -220,24 +233,83 @@ public final class ARSessionManager: NSObject, ObservableObject {
         await startSession(resetTracking: true)
     }
 
-    /// Drains incremental mesh anchor additions, updates, and removals since the last render sync.
-    public func consumePendingMeshChanges() -> (upserted: [ARMeshAnchor], removed: [UUID]) {
-        let upserted = pendingUpsertedMeshIDs.compactMap { meshAnchorsByID[$0] }
-        let removed = Array(pendingRemovedMeshIDs)
-        pendingUpsertedMeshIDs.removeAll()
-        pendingRemovedMeshIDs.removeAll()
-        return (upserted, removed)
-    }
-
-    /// Returns all currently known mesh anchors (useful when initializing a new view).
+    /// Returns all currently known mesh anchors.
     public func allMeshAnchors() -> [ARMeshAnchor] {
         Array(meshAnchorsByID.values)
     }
 
+    /// Inserts or updates a tracked `ARMeshAnchor` identifier/transform mapping and enforces anchor caps.
+    /// Useful for testing and internal anchor lifecycle bookkeeping.
+    public func registerMeshAnchorForBookkeeping(_ anchor: ARMeshAnchor) {
+        meshAnchorsByID[anchor.identifier] = anchor
+        pruneStaleOrDistantMeshAnchors(maxAnchors: Self.maxRetainedMeshAnchors)
+        syncMeshAnchorCount()
+    }
+
+    /// Prunes the farthest `ARMeshAnchor` entries relative to `currentCameraPosition`
+    /// whenever the active anchor count exceeds `maxAnchors`.
+    @discardableResult
+    public func pruneStaleOrDistantMeshAnchors(maxAnchors: Int) -> Int {
+        guard maxAnchors >= 0, meshAnchorsByID.count > maxAnchors else {
+            return 0
+        }
+
+        let entries = meshAnchorsByID.map { (id, anchor) in
+            let pos = simd_float3(anchor.transform.columns.3.x, anchor.transform.columns.3.y, anchor.transform.columns.3.z)
+            return (id: id, position: pos)
+        }
+        let idsToKeep = Self.idsToRetain(
+            from: entries,
+            relativeTo: currentCameraPosition,
+            maxRetained: maxAnchors
+        )
+
+        var removed = 0
+        for id in Array(meshAnchorsByID.keys) where !idsToKeep.contains(id) {
+            meshAnchorsByID.removeValue(forKey: id)
+            removed += 1
+        }
+        syncMeshAnchorCount()
+        return removed
+    }
+
+    /// Pure distance-based anchor retention helper: keeps the closest `maxRetained` anchors
+    /// to `referencePosition` so Jetsam pressure during large scans evicts distant chunks first.
+    nonisolated public static func idsToRetain(
+        from entries: [(id: UUID, position: simd_float3)],
+        relativeTo referencePosition: simd_float3,
+        maxRetained: Int
+    ) -> Set<UUID> {
+        guard maxRetained > 0 else { return [] }
+        guard entries.count > maxRetained else {
+            return Set(entries.map(\.id))
+        }
+        let sortedByNearest = entries.sorted { lhs, rhs in
+            simd_distance_squared(lhs.position, referencePosition) < simd_distance_squared(rhs.position, referencePosition)
+        }
+        return Set(sortedByNearest.prefix(maxRetained).map(\.id))
+    }
+
+    /// Responds to `UIApplication.didReceiveMemoryWarningNotification` by pruning distant mesh anchors.
+    public func handleMemoryWarning() {
+        let removed = pruneStaleOrDistantMeshAnchors(maxAnchors: Self.memoryWarningMeshAnchorCap)
+        if removed > 0 {
+            trackingStatusMessage = "Memory optimized (pruned \(removed) distant mesh chunks)"
+        }
+    }
+
     /// Captures thread-safe `Sendable` vertex, normal, face, and classification snapshots
-    /// synchronously on the main actor so baking can run completely off the main thread.
+    /// synchronously on the main actor inside `autoreleasepool` so baking can run off-main-thread
+    /// with minimal peak transient allocations.
     public func extractMeshSnapshots() -> [MeshAnchorSnapshot] {
-        meshAnchorsByID.values.map { MeshAnchorSnapshot.capture(from: $0) }
+        var snapshots: [MeshAnchorSnapshot] = []
+        snapshots.reserveCapacity(meshAnchorsByID.count)
+        for anchor in meshAnchorsByID.values {
+            autoreleasepool {
+                snapshots.append(MeshAnchorSnapshot.capture(from: anchor))
+            }
+        }
+        return snapshots
     }
 
     /// Maps the current `UIInterfaceOrientation` to the `CGImagePropertyOrientation`
@@ -290,85 +362,91 @@ public final class ARSessionManager: NSObject, ObservableObject {
     }
 
     private func clearMeshState() {
-        let existingIDs = Array(meshAnchorsByID.keys)
         meshAnchorsByID.removeAll()
-        pendingUpsertedMeshIDs.removeAll()
-        pendingRemovedMeshIDs.formUnion(existingIDs)
-        meshRevision &+= 1
+        syncMeshAnchorCount()
+    }
+
+    private func syncMeshAnchorCount() {
+        let count = meshAnchorsByID.count
+        if trackedMeshAnchorCount != count {
+            trackedMeshAnchorCount = count
+        }
     }
 
     private func handleFrameUpdate(_ frame: ARFrame, in session: ARSession) {
-        let transform = frame.camera.transform
-        currentCameraTransform = transform
+        autoreleasepool {
+            let transform = frame.camera.transform
+            currentCameraTransform = transform
 
-        let cameraPos = simd_float3(
-            transform.columns.3.x,
-            transform.columns.3.y,
-            transform.columns.3.z
-        )
+            let cameraPos = simd_float3(
+                transform.columns.3.x,
+                transform.columns.3.y,
+                transform.columns.3.z
+            )
 
-        // Throttle SwiftUI position broadcasts to reduce unnecessary view diffs at 60/120 Hz.
-        if simd_distance(cameraPos, lastPublishedPosition) >= 0.04 {
-            lastPublishedPosition = cameraPos
-            currentCameraPosition = cameraPos
-        }
+            // Throttle SwiftUI position broadcasts to reduce unnecessary view diffs at 60/120 Hz.
+            if simd_distance(cameraPos, lastPublishedPosition) >= 0.04 {
+                lastPublishedPosition = cameraPos
+                currentCameraPosition = cameraPos
+            }
 
-        guard !isProcessingFrame else {
-            return
-        }
+            guard !isProcessingFrame else {
+                return
+            }
 
-        guard case .normal = frame.camera.trackingState else {
-            return
-        }
+            guard case .normal = frame.camera.trackingState else {
+                return
+            }
 
-        guard let detector else { return }
+            guard let detector else { return }
 
-        guard throttlePolicy.shouldEmitKeyframe(
-            timestamp: frame.timestamp,
-            cameraPosition: cameraPos,
-            isInferenceInFlight: isProcessingFrame
-        ) else {
-            return
-        }
+            guard throttlePolicy.shouldEmitKeyframe(
+                timestamp: frame.timestamp,
+                cameraPosition: cameraPos,
+                isInferenceInFlight: isProcessingFrame
+            ) else {
+                return
+            }
 
-        // Synchronously extract pixel buffer and camera pose/intrinsics so `ARFrame`
-        // is released immediately when `session(_:didUpdate:)` returns.
-        let imageOrientation = Self.rearCameraVisionOrientation(for: currentInterfaceOrientation())
-        let payload = ExtractedFramePayload(
-            pixelBuffer: frame.capturedImage,
-            cameraTransform: transform,
-            intrinsics: frame.camera.intrinsics,
-            imageResolution: frame.camera.imageResolution,
-            imageOrientation: imageOrientation
-        )
+            // Synchronously extract pixel buffer and camera pose/intrinsics so `ARFrame`
+            // is released immediately when `session(_:didUpdate:)` returns.
+            let imageOrientation = Self.rearCameraVisionOrientation(for: currentInterfaceOrientation())
+            let payload = ExtractedFramePayload(
+                pixelBuffer: frame.capturedImage,
+                cameraTransform: transform,
+                intrinsics: frame.camera.intrinsics,
+                imageResolution: frame.camera.imageResolution,
+                imageOrientation: imageOrientation
+            )
 
-        let inferenceID = UUID()
-        activeInferenceID = inferenceID
-        isProcessingFrame = true
-        isInferenceInFlight = true
+            let inferenceID = UUID()
+            activeInferenceID = inferenceID
+            isProcessingFrame = true
+            isInferenceInFlight = true
 
-        inferenceTask = Task.detached(priority: .userInitiated) { [weak self, detector] in
-            do {
-                let detections = try await Self.runDetection(
-                    detector: detector,
-                    payload: payload
-                )
+            inferenceTask = Task.detached(priority: .userInitiated) { [weak self, detector] in
+                do {
+                    let detections = try await Self.runDetection(
+                        detector: detector,
+                        payload: payload
+                    )
 
-                guard !Task.isCancelled else {
+                    guard !Task.isCancelled else {
+                        await self?.finishInference(id: inferenceID)
+                        return
+                    }
+
+                    await self?.completeDetection(
+                        detections,
+                        payload: payload,
+                        isLocalDetector: detector is LocalEquipmentDetector,
+                        inferenceID: inferenceID
+                    )
+                } catch is CancellationError {
                     await self?.finishInference(id: inferenceID)
-                    return
+                } catch {
+                    await self?.failInference(message: error.localizedDescription, id: inferenceID)
                 }
-
-                await self?.completeDetection(
-                    detections,
-                    payload: payload,
-                    isLocalDetector: detector is LocalEquipmentDetector,
-                    inferenceID: inferenceID
-                )
-            } catch is CancellationError {
-                await self?.finishInference(id: inferenceID)
-            } catch {
-                await self?.failInference(message: error.localizedDescription, id: inferenceID)
             }
         }
     }
@@ -387,23 +465,27 @@ public final class ARSessionManager: NSObject, ObservableObject {
             : .up
 
         let timestamp = Date()
-        for detection in detections {
-            if let projected = projector.projectWithMetadata(
-                detection: detection,
-                cameraTransform: payload.cameraTransform,
-                intrinsics: payload.intrinsics,
-                imageResolution: payload.imageResolution,
-                imageOrientation: projectionOrientation,
-                session: session,
-                timestamp: timestamp
-            ) {
-                clusteringManager?.registerDetection(
-                    label: detection.label,
-                    confidence: projected.confidence,
-                    worldPosition: projected.worldPosition,
-                    estimatedWidthMeters: projected.estimatedWidthMeters,
-                    timestamp: projected.timestamp
-                )
+        autoreleasepool {
+            for detection in detections {
+                if let projected = projector.projectWithMetadata(
+                    detection: detection,
+                    cameraTransform: payload.cameraTransform,
+                    intrinsics: payload.intrinsics,
+                    imageResolution: payload.imageResolution,
+                    imageOrientation: projectionOrientation,
+                    session: session,
+                    timestamp: timestamp
+                ) {
+                    // Capture lightweight observation candidates silently during live scan;
+                    // heavy 3D text labels and strict NMS deduplication run once during Bake.
+                    clusteringManager?.recordObservationCandidate(
+                        label: detection.label,
+                        confidence: projected.confidence,
+                        worldPosition: projected.worldPosition,
+                        boundingBox3DExtent: projected.boundingBox3DExtent,
+                        timestamp: projected.timestamp
+                    )
+                }
             }
         }
     }
@@ -436,40 +518,43 @@ public final class ARSessionManager: NSObject, ObservableObject {
     }
 
     private func handleAnchorsAdded(_ anchors: [ARAnchor]) {
-        var didModifyMesh = false
-        for case let meshAnchor as ARMeshAnchor in anchors {
-            meshAnchorsByID[meshAnchor.identifier] = meshAnchor
-            pendingUpsertedMeshIDs.insert(meshAnchor.identifier)
-            pendingRemovedMeshIDs.remove(meshAnchor.identifier)
-            didModifyMesh = true
-        }
-        if didModifyMesh {
-            meshRevision &+= 1
+        autoreleasepool {
+            var didModify = false
+            for case let meshAnchor as ARMeshAnchor in anchors {
+                meshAnchorsByID[meshAnchor.identifier] = meshAnchor
+                didModify = true
+            }
+            if didModify {
+                pruneStaleOrDistantMeshAnchors(maxAnchors: Self.maxRetainedMeshAnchors)
+                syncMeshAnchorCount()
+            }
         }
     }
 
     private func handleAnchorsUpdated(_ anchors: [ARAnchor]) {
-        var didModifyMesh = false
-        for case let meshAnchor as ARMeshAnchor in anchors {
-            meshAnchorsByID[meshAnchor.identifier] = meshAnchor
-            pendingUpsertedMeshIDs.insert(meshAnchor.identifier)
-            didModifyMesh = true
-        }
-        if didModifyMesh {
-            meshRevision &+= 1
+        autoreleasepool {
+            var didModify = false
+            for case let meshAnchor as ARMeshAnchor in anchors {
+                meshAnchorsByID[meshAnchor.identifier] = meshAnchor
+                didModify = true
+            }
+            if didModify {
+                syncMeshAnchorCount()
+            }
         }
     }
 
     private func handleAnchorsRemoved(_ anchors: [ARAnchor]) {
-        var didModifyMesh = false
-        for case let meshAnchor as ARMeshAnchor in anchors {
-            meshAnchorsByID.removeValue(forKey: meshAnchor.identifier)
-            pendingUpsertedMeshIDs.remove(meshAnchor.identifier)
-            pendingRemovedMeshIDs.insert(meshAnchor.identifier)
-            didModifyMesh = true
-        }
-        if didModifyMesh {
-            meshRevision &+= 1
+        autoreleasepool {
+            var didModify = false
+            for case let meshAnchor as ARMeshAnchor in anchors {
+                if meshAnchorsByID.removeValue(forKey: meshAnchor.identifier) != nil {
+                    didModify = true
+                }
+            }
+            if didModify {
+                syncMeshAnchorCount()
+            }
         }
     }
 

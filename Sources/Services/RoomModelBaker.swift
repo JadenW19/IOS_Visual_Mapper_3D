@@ -172,72 +172,82 @@ public actor RoomModelBaker {
                 continue
             }
 
-            let worldPositions = Self.transformVertices(snapshot: snapshot)
-            let worldNormals = Self.transformNormals(snapshot: snapshot)
+            autoreleasepool {
+                let worldPositions = Self.transformVertices(snapshot: snapshot)
+                let worldNormals = Self.transformNormals(snapshot: snapshot)
 
-            // Per-anchor, per-category vertex index remapping preserves topological sharing
-            // inside each anchor without duplicating vertices for every adjacent triangle.
-            var vertexRemaps: [RoomSurfaceCategory: [Int: UInt32]] = [:]
+                // Per-anchor, per-category vertex index remapping preserves topological sharing
+                // inside each anchor without duplicating vertices for every adjacent triangle.
+                var vertexRemaps: [RoomSurfaceCategory: [Int: UInt32]] = [:]
 
-            let faceCount = snapshot.faceCount
-            let bytesPerIndex = snapshot.bytesPerIndex
+                let faceCount = snapshot.faceCount
+                let bytesPerIndex = snapshot.bytesPerIndex
 
-            snapshot.indexData.withUnsafeBytes { rawIndexBuffer in
-                for faceIndex in 0..<faceCount {
-                    let baseByteOffset = faceIndex * 3 * bytesPerIndex
-                    guard let i0 = Self.readIndex(from: rawIndexBuffer, byteOffset: baseByteOffset, bytesPerIndex: bytesPerIndex),
-                          let i1 = Self.readIndex(from: rawIndexBuffer, byteOffset: baseByteOffset + bytesPerIndex, bytesPerIndex: bytesPerIndex),
-                          let i2 = Self.readIndex(from: rawIndexBuffer, byteOffset: baseByteOffset + 2 * bytesPerIndex, bytesPerIndex: bytesPerIndex),
-                          i0 < worldPositions.count,
-                          i1 < worldPositions.count,
-                          i2 < worldPositions.count,
-                          i0 != i1, i1 != i2, i0 != i2
-                    else {
-                        continue
-                    }
-
-                    let p0 = worldPositions[i0]
-                    let p1 = worldPositions[i1]
-                    let p2 = worldPositions[i2]
-
-                    let edge1 = p1 - p0
-                    let edge2 = p2 - p0
-                    let cross = simd_cross(edge1, edge2)
-                    let crossLength = simd_length(cross)
-                    let fallbackNormal: SIMD3<Float> = crossLength > 1e-6
-                        ? cross / crossLength
-                        : SIMD3<Float>(0, 1, 0)
-
-                    let category = Self.surfaceCategory(
-                        snapshot: snapshot,
-                        faceIndex: faceIndex
-                    )
-
-                    var builder = builders[category] ?? CategoryBuilder()
-                    var remap = vertexRemaps[category] ?? [:]
-
-                    for vertexIdx in [i0, i1, i2] {
-                        if let existing = remap[vertexIdx] {
-                            builder.indices.append(existing)
-                        } else {
-                            let newIdx = UInt32(builder.positions.count)
-                            let pos = worldPositions[vertexIdx]
-                            let norm = vertexIdx < worldNormals.count
-                                ? worldNormals[vertexIdx]
-                                : fallbackNormal
-
-                            builder.positions.append(pos)
-                            builder.normals.append(norm)
-                            builder.indices.append(newIdx)
-                            remap[vertexIdx] = newIdx
-
-                            boundsMin = simd_min(boundsMin, pos)
-                            boundsMax = simd_max(boundsMax, pos)
+                snapshot.indexData.withUnsafeBytes { rawIndexBuffer in
+                    for faceIndex in 0..<faceCount {
+                        let baseByteOffset = faceIndex * 3 * bytesPerIndex
+                        guard let i0 = Self.readIndex(from: rawIndexBuffer, byteOffset: baseByteOffset, bytesPerIndex: bytesPerIndex),
+                              let i1 = Self.readIndex(from: rawIndexBuffer, byteOffset: baseByteOffset + bytesPerIndex, bytesPerIndex: bytesPerIndex),
+                              let i2 = Self.readIndex(from: rawIndexBuffer, byteOffset: baseByteOffset + 2 * bytesPerIndex, bytesPerIndex: bytesPerIndex),
+                              i0 < worldPositions.count,
+                              i1 < worldPositions.count,
+                              i2 < worldPositions.count,
+                              i0 != i1, i1 != i2, i0 != i2
+                        else {
+                            continue
                         }
-                    }
 
-                    vertexRemaps[category] = remap
-                    builders[category] = builder
+                        let p0 = worldPositions[i0]
+                        let p1 = worldPositions[i1]
+                        let p2 = worldPositions[i2]
+
+                        let edge1 = p1 - p0
+                        let edge2 = p2 - p0
+                        let cross = simd_cross(edge1, edge2)
+                        let crossLength = simd_length(cross)
+                        let faceWeightedNormal: SIMD3<Float> = crossLength > 1e-6
+                            ? cross
+                            : SIMD3<Float>(0, 1, 0)
+                        let unitFaceNormal: SIMD3<Float> = crossLength > 1e-6
+                            ? cross / crossLength
+                            : SIMD3<Float>(0, 1, 0)
+
+                        let category = Self.surfaceCategory(
+                            snapshot: snapshot,
+                            faceIndex: faceIndex
+                        )
+
+                        var builder = builders[category] ?? CategoryBuilder()
+                        var remap = vertexRemaps[category] ?? [:]
+
+                        for vertexIdx in [i0, i1, i2] {
+                            if let existing = remap[vertexIdx] {
+                                builder.indices.append(existing)
+                                // Accumulate area-weighted normals when sharing vertices across triangles.
+                                let intIdx = Int(existing)
+                                if vertexIdx >= worldNormals.count {
+                                    builder.normals[intIdx] += faceWeightedNormal
+                                }
+                            } else {
+                                let newIdx = UInt32(builder.positions.count)
+                                let pos = worldPositions[vertexIdx]
+                                let norm = vertexIdx < worldNormals.count
+                                    ? worldNormals[vertexIdx]
+                                    : unitFaceNormal
+
+                                builder.positions.append(pos)
+                                builder.normals.append(norm)
+                                builder.indices.append(newIdx)
+                                remap[vertexIdx] = newIdx
+
+                                boundsMin = simd_min(boundsMin, pos)
+                                boundsMax = simd_max(boundsMax, pos)
+                            }
+                        }
+
+                        vertexRemaps[category] = remap
+                        builders[category] = builder
+                    }
                 }
             }
 
@@ -257,10 +267,14 @@ public actor RoomModelBaker {
             guard let builder = builders[category], !builder.indices.isEmpty else {
                 continue
             }
+            let normalizedNormals = builder.normals.map { n -> SIMD3<Float> in
+                let len = simd_length(n)
+                return len > 1e-6 ? n / len : SIMD3<Float>(0, 1, 0)
+            }
             let submesh = BakedSubmesh(
                 category: category,
                 positions: builder.positions,
-                normals: builder.normals,
+                normals: normalizedNormals,
                 indices: builder.indices
             )
             totalVertices += submesh.positions.count
@@ -420,10 +434,14 @@ public actor RoomModelBaker {
             return .floor
         case .wall:
             return .wall
-        case .table, .seat:
-            return .furniture
-        case .window, .door:
-            return .opening
+        case .table:
+            return .table
+        case .seat:
+            return .seat
+        case .window:
+            return .window
+        case .door:
+            return .door
         case .ceiling:
             return .ceiling
         case .none:

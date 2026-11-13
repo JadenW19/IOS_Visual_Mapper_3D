@@ -4,13 +4,14 @@ import VisualMapperCore
 import simd
 
 private enum MapperStage: Equatable {
+    case home
     case scanning
     case baking(progress: Double, status: String)
     case viewing(BakedRoomScan)
 }
 
-/// Primary root interface supporting two-stage live AR room scanning -> baked 3D Dollhouse
-/// inspection, persisted scan browsing, and floating equipment navigation.
+/// Primary root interface supporting the Aunty.cloud clinical dashboard, two-stage
+/// live AR capture -> baked 3D Dollhouse inspection, and tap-to-inspect asset knowledge cards.
 public struct ContentView: View {
     @Environment(\.scenePhase) private var scenePhase
 
@@ -20,8 +21,10 @@ public struct ContentView: View {
 
     private let modelBaker = RoomModelBaker()
     private let storageManager = ScanStorageManager()
+    private let knowledgeService = HybridEquipmentKnowledgeService()
 
-    @State private var stage: MapperStage = .scanning
+    @State private var stage: MapperStage = .home
+    @State private var environmentMode: EnvironmentMode = .clinicalLab
     @State private var meshRenderStyle: MeshRenderStyle = .wireframe
     @State private var showCeiling: Bool = false
     @State private var modelLoadErrorMessage: String?
@@ -29,6 +32,7 @@ public struct ContentView: View {
     @State private var hasConfiguredPipeline = false
     @State private var bakingTask: Task<Void, Never>?
 
+    @State private var inspectedEquipment: TrackedEquipment3D?
     @State private var showSavedScansSheet = false
     @State private var savedScans: [SavedRoomScanMetadata] = []
     @State private var isLoadingSavedScans = false
@@ -38,50 +42,85 @@ public struct ContentView: View {
 
     public var body: some View {
         ZStack {
-            sceneContent
-                .ignoresSafeArea()
+            if stage == .home {
+                ZStack(alignment: .bottom) {
+                    HomeView(
+                        environmentMode: $environmentMode,
+                        savedScans: savedScans,
+                        isLoadingScans: isLoadingSavedScans,
+                        onStartNewScan: {
+                            startNewEnvironmentScan()
+                        },
+                        onOpenScan: { metadata in
+                            openSavedScan(id: metadata.id)
+                        },
+                        onDeleteScan: { metadata in
+                            deleteSavedScan(id: metadata.id)
+                        },
+                        onRefreshScans: {
+                            Task { await refreshSavedScans() }
+                        }
+                    )
 
-            VStack(spacing: 0) {
-                topBar
-                    .zIndex(10)
-
-                Spacer()
-
-                if case let .baking(progress, status) = stage {
-                    bakingProgressOverlay(progress: progress, status: status)
-                        .padding(.horizontal, 24)
-                    Spacer()
-                } else {
-                    if case let .failed(error) = sessionManager.sessionState,
-                       stage == .scanning {
-                        errorOverlay(for: error)
-                            .padding(.horizontal, 20)
-                        Spacer()
-                    } else if let scanActionErrorMessage {
+                    if let scanActionErrorMessage {
                         dismissibleErrorBanner(message: scanActionErrorMessage) {
                             self.scanActionErrorMessage = nil
                         }
                         .padding(.horizontal, 16)
-                        .padding(.bottom, 8)
-                    } else if let modelLoadErrorMessage, stage == .scanning {
-                        modelErrorBanner(message: modelLoadErrorMessage)
+                        .padding(.bottom, 16)
+                    }
+                }
+            } else {
+                sceneContent
+                    .ignoresSafeArea()
+
+                VStack(spacing: 0) {
+                    topBar
+                        .zIndex(10)
+
+                    Spacer()
+
+                    if case let .baking(progress, status) = stage {
+                        bakingProgressOverlay(progress: progress, status: status)
+                            .padding(.horizontal, 24)
+                        Spacer()
+                    } else {
+                        if case let .failed(error) = sessionManager.sessionState,
+                           stage == .scanning {
+                            errorOverlay(for: error)
+                                .padding(.horizontal, 20)
+                            Spacer()
+                        } else if let scanActionErrorMessage {
+                            dismissibleErrorBanner(message: scanActionErrorMessage) {
+                                self.scanActionErrorMessage = nil
+                            }
                             .padding(.horizontal, 16)
                             .padding(.bottom, 8)
-                    }
+                        } else if let modelLoadErrorMessage, stage == .scanning {
+                            modelErrorBanner(message: modelLoadErrorMessage)
+                                .padding(.horizontal, 16)
+                                .padding(.bottom, 8)
+                        }
 
-                    if stage == .scanning {
-                        finishScanButton
-                            .padding(.horizontal, 16)
-                            .padding(.bottom, 10)
-                            .zIndex(10)
-                    }
+                        if stage == .scanning {
+                            finishScanButton
+                                .padding(.horizontal, 16)
+                                .padding(.bottom, 10)
+                                .zIndex(10)
+                        }
 
-                    EquipmentListView(
-                        clusteringManager: clusteringManager,
-                        focusController: focusController,
-                        userPosition: activeViewerPosition
-                    )
-                    .zIndex(10)
+                        EquipmentListView(
+                            clusteringManager: clusteringManager,
+                            focusController: focusController,
+                            userPosition: activeViewerPosition,
+                            environmentMode: environmentMode,
+                            isLiveCaptureMode: stage == .scanning,
+                            onInspectEquipment: { item in
+                                inspectedEquipment = item
+                            }
+                        )
+                        .zIndex(10)
+                    }
                 }
             }
         }
@@ -99,9 +138,16 @@ public struct ContentView: View {
                 }
             )
         }
+        .sheet(item: $inspectedEquipment) { item in
+            EquipmentDetailSheet(
+                item: item,
+                environmentMode: environmentMode,
+                knowledgeService: knowledgeService
+            )
+        }
         .task {
             configurePipelineIfNeeded()
-            await sessionManager.startSession()
+            await refreshSavedScans()
         }
         .onChange(of: scenePhase) { _, newPhase in
             switch newPhase {
@@ -124,6 +170,8 @@ public struct ContentView: View {
     @ViewBuilder
     private var sceneContent: some View {
         switch stage {
+        case .home:
+            EmptyView()
         case .scanning, .baking:
             RealitySceneView(
                 sessionManager: sessionManager,
@@ -139,6 +187,7 @@ public struct ContentView: View {
                 showCeiling: showCeiling,
                 onSelectEquipment: { item in
                     focusController.focusOnEquipment(item)
+                    inspectedEquipment = item
                 }
             )
         }
@@ -156,10 +205,10 @@ public struct ContentView: View {
     @ViewBuilder
     private var topBar: some View {
         switch stage {
+        case .home, .baking:
+            EmptyView()
         case .scanning:
             topScanningBar
-        case .baking:
-            EmptyView()
         case let .viewing(scan):
             topDollhouseBar(scan: scan)
         }
@@ -167,6 +216,17 @@ public struct ContentView: View {
 
     private var topScanningBar: some View {
         HStack(spacing: 8) {
+            Button {
+                returnToHome()
+            } label: {
+                Image(systemName: "house.fill")
+                    .font(.body.weight(.semibold))
+                    .padding(8)
+                    .background(.ultraThinMaterial, in: Circle())
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel("Aunty.cloud Home")
+
             HStack(spacing: 8) {
                 Circle()
                     .fill(statusColor)
@@ -188,18 +248,7 @@ public struct ContentView: View {
                 }
             }
             .pickerStyle(.segmented)
-            .frame(maxWidth: 145)
-
-            Button {
-                presentSavedScans()
-            } label: {
-                Image(systemName: "folder.fill")
-                    .font(.body.weight(.semibold))
-                    .padding(8)
-                    .background(.ultraThinMaterial, in: Circle())
-            }
-            .buttonStyle(.plain)
-            .accessibilityLabel("Saved scans")
+            .frame(maxWidth: 135)
 
             Button {
                 focusController.exitFocusMode()
@@ -219,6 +268,17 @@ public struct ContentView: View {
 
     private func topDollhouseBar(scan: BakedRoomScan) -> some View {
         HStack(spacing: 8) {
+            Button {
+                returnToHome()
+            } label: {
+                Image(systemName: "house.fill")
+                    .font(.body.weight(.semibold))
+                    .padding(8)
+                    .background(.ultraThinMaterial, in: Circle())
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel("Aunty.cloud Home")
+
             VStack(alignment: .leading, spacing: 2) {
                 Text(scan.metadata.name)
                     .font(.caption.weight(.bold))
@@ -257,9 +317,9 @@ public struct ContentView: View {
             .accessibilityLabel("Saved scans")
 
             Button {
-                returnToLiveScanner()
+                startNewEnvironmentScan()
             } label: {
-                Label("New Scan", systemImage: "camera.viewfinder")
+                Label("Rescan", systemImage: "camera.viewfinder")
                     .font(.caption.weight(.semibold))
                     .padding(.horizontal, 10)
                     .padding(.vertical, 7)
@@ -432,15 +492,40 @@ public struct ContentView: View {
 
     // MARK: - Scan & Bake Workflow Actions
 
+    private func startNewEnvironmentScan() {
+        configurePipelineIfNeeded()
+        focusController.disableDollhouseOrbit()
+        inspectedEquipment = nil
+        scanActionErrorMessage = nil
+        stage = .scanning
+        Task {
+            await sessionManager.resetSession()
+        }
+    }
+
+    private func returnToHome() {
+        bakingTask?.cancel()
+        bakingTask = nil
+        sessionManager.pauseSession()
+        focusController.disableDollhouseOrbit()
+        inspectedEquipment = nil
+        scanActionErrorMessage = nil
+        stage = .home
+        Task {
+            await refreshSavedScans()
+        }
+    }
+
     private func finishAndProcessScan() {
         scanActionErrorMessage = nil
         sessionManager.pauseSession()
         focusController.exitFocusMode()
 
         let snapshots = sessionManager.extractMeshSnapshots()
-        let equipmentSnapshot = clusteringManager.trackedEquipment
+        let activeMode = environmentMode
 
-        stage = .baking(progress: 0.05, status: "Preparing LiDAR mesh buffers…")
+        stage = .baking(progress: 0.05, status: "Consolidating 3D observations (NMS)…")
+        let consolidatedEquipment = clusteringManager.consolidateObservations()
 
         bakingTask?.cancel()
         bakingTask = Task {
@@ -464,11 +549,13 @@ public struct ContentView: View {
                 let defaultName = "Room Scan • \(Date().formatted(date: .abbreviated, time: .shortened))"
                 let metadata = try await storageManager.saveScan(
                     name: defaultName,
+                    environmentMode: activeMode,
                     geometry: geometry,
-                    equipment: equipmentSnapshot
+                    equipment: consolidatedEquipment
                 )
                 let bakedScan = BakedRoomScan(metadata: metadata, geometry: geometry)
 
+                await refreshSavedScans()
                 await MainActor.run {
                     self.enterDollhouseViewer(with: bakedScan)
                 }
@@ -489,6 +576,7 @@ public struct ContentView: View {
     @MainActor
     private func enterDollhouseViewer(with scan: BakedRoomScan) {
         clusteringManager.loadEquipment(scan.metadata.equipment)
+        inspectedEquipment = nil
         showCeiling = false
         scanActionErrorMessage = nil
         focusController.configureDollhouseOrbit(
@@ -499,33 +587,29 @@ public struct ContentView: View {
         stage = .viewing(scan)
     }
 
-    private func returnToLiveScanner() {
-        focusController.disableDollhouseOrbit()
-        scanActionErrorMessage = nil
-        stage = .scanning
-        Task {
-            await sessionManager.resetSession()
+    private func refreshSavedScans() async {
+        await MainActor.run {
+            self.isLoadingSavedScans = true
+            self.savedScansErrorMessage = nil
+        }
+        do {
+            let list = try await storageManager.listSavedScans()
+            await MainActor.run {
+                self.savedScans = list
+                self.isLoadingSavedScans = false
+            }
+        } catch {
+            await MainActor.run {
+                self.savedScansErrorMessage = error.localizedDescription
+                self.isLoadingSavedScans = false
+            }
         }
     }
 
     private func presentSavedScans() {
-        savedScansErrorMessage = nil
-        isLoadingSavedScans = true
         showSavedScansSheet = true
-
         Task {
-            do {
-                let list = try await storageManager.listSavedScans()
-                await MainActor.run {
-                    self.savedScans = list
-                    self.isLoadingSavedScans = false
-                }
-            } catch {
-                await MainActor.run {
-                    self.savedScansErrorMessage = error.localizedDescription
-                    self.isLoadingSavedScans = false
-                }
-            }
+            await refreshSavedScans()
         }
     }
 
@@ -543,9 +627,8 @@ public struct ContentView: View {
                 }
             } catch {
                 await MainActor.run {
-                    self.stage = .scanning
+                    self.stage = .home
                     self.scanActionErrorMessage = error.localizedDescription
-                    Task { await self.sessionManager.startSession(resetTracking: false) }
                 }
             }
         }
@@ -555,10 +638,7 @@ public struct ContentView: View {
         Task {
             do {
                 try await storageManager.deleteScan(id: id)
-                let updated = try await storageManager.listSavedScans()
-                await MainActor.run {
-                    self.savedScans = updated
-                }
+                await refreshSavedScans()
             } catch {
                 await MainActor.run {
                     self.savedScansErrorMessage = error.localizedDescription

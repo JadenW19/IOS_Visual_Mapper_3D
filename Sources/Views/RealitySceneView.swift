@@ -64,22 +64,19 @@ private struct ARSceneViewRepresentable: UIViewRepresentable {
         arView.scene.addAnchor(rootAnchor)
         rootAnchor.addChild(context.coordinator.sceneCoordinator.rootEntity)
 
-        let supportsWireframeLines: Bool
+        let supportsBillboard: Bool
         if #available(iOS 18.0, *) {
-            supportsWireframeLines = true
+            supportsBillboard = true
         } else {
-            supportsWireframeLines = false
+            supportsBillboard = false
         }
 
-        context.coordinator.sceneCoordinator.syncMeshes(
-            from: sessionManager,
-            renderStyle: meshRenderStyle,
-            useWireframeLines: supportsWireframeLines
-        )
-        context.coordinator.sceneCoordinator.syncEquipmentMarkers(
-            items: clusteringManager.trackedEquipment,
+        context.coordinator.sceneCoordinator.applyHardwareMeshStyle(meshRenderStyle, on: arView)
+        context.coordinator.sceneCoordinator.syncLiveDots(
+            candidates: clusteringManager.observationCandidates,
+            finalizedEquipment: clusteringManager.trackedEquipment,
             focusedID: focusController.focusedItemID,
-            useBillboardComponent: supportsWireframeLines
+            useBillboardComponent: supportsBillboard
         )
 
         context.coordinator.observeFrameUpdates(
@@ -99,30 +96,23 @@ private struct ARSceneViewRepresentable: UIViewRepresentable {
             uiView.environment.background = shouldUseVirtual ? .color(.black) : .cameraFeed()
         }
 
-        let supportsWireframeLines: Bool
+        let supportsBillboard: Bool
         if #available(iOS 18.0, *) {
-            supportsWireframeLines = true
+            supportsBillboard = true
         } else {
-            supportsWireframeLines = false
+            supportsBillboard = false
         }
 
         sceneCoord.setVirtualCameraActive(
             shouldUseVirtual,
             transform: focusController.virtualCameraTransform
         )
-        sceneCoord.syncMeshes(
-            from: sessionManager,
-            renderStyle: meshRenderStyle,
-            useWireframeLines: supportsWireframeLines
-        )
-        sceneCoord.syncEquipmentMarkers(
-            items: clusteringManager.trackedEquipment,
+        sceneCoord.applyHardwareMeshStyle(meshRenderStyle, on: uiView)
+        sceneCoord.syncLiveDots(
+            candidates: clusteringManager.observationCandidates,
+            finalizedEquipment: clusteringManager.trackedEquipment,
             focusedID: focusController.focusedItemID,
-            useBillboardComponent: supportsWireframeLines
-        )
-        sceneCoord.updateMeshMaterials(
-            renderStyle: meshRenderStyle,
-            useWireframeLines: supportsWireframeLines
+            useBillboardComponent: supportsBillboard
         )
     }
 
@@ -158,19 +148,20 @@ private struct ARSceneViewRepresentable: UIViewRepresentable {
 @MainActor
 final class RealitySceneCoordinator: ObservableObject {
     let rootEntity = Entity()
-    let meshRootEntity = Entity()
     let markersRootEntity = Entity()
     let virtualCameraEntity = PerspectiveCamera()
 
-    private var meshEntitiesByID: [UUID: ModelEntity] = [:]
-    private var markerEntitiesByID: [UUID: Entity] = [:]
-    private var markerNodesByID: [UUID: EquipmentMarkerNode] = [:]
+    private var candidateDotEntitiesByID: [UUID: ModelEntity] = [:]
+    private var focusedMarkerNode: EquipmentMarkerNode?
+    private var focusedMarkerItemID: UUID?
     private var activeMeshStyle: MeshRenderStyle?
-    private var activeUseWireframeLines: Bool?
-    private var cachedMeshMaterial: (any RealityKit.Material)?
+
+    // Single shared sphere mesh + material across all live scan dots so GPU memory stays O(1).
+    private let sharedDotMesh: MeshResource = MeshResource.generateSphere(radius: 0.015)
+    private let sharedDotMaterial = UnlitMaterial(color: UIColor.systemCyan.withAlphaComponent(0.78))
+    private let maxLiveIndicatorDots: Int = 180
 
     init() {
-        rootEntity.addChild(meshRootEntity)
         rootEntity.addChild(markersRootEntity)
 
         virtualCameraEntity.camera.fieldOfViewInDegrees = 60
@@ -192,215 +183,101 @@ final class RealitySceneCoordinator: ObservableObject {
         }
     }
 
-    func syncMeshes(
-        from sessionManager: ARSessionManager,
-        renderStyle: MeshRenderStyle,
-        useWireframeLines: Bool
-    ) {
-        if renderStyle != activeMeshStyle || useWireframeLines != activeUseWireframeLines {
-            updateMeshMaterials(renderStyle: renderStyle, useWireframeLines: useWireframeLines)
-        }
-
-        let changes = sessionManager.consumePendingMeshChanges()
-
-        for removedID in changes.removed {
-            if let entity = meshEntitiesByID.removeValue(forKey: removedID) {
-                entity.removeFromParent()
-            }
-        }
-
-        // Seed existing meshes on first attachment if the coordinator's mesh map is empty.
-        let anchorsToBuild: [ARMeshAnchor]
-        if meshEntitiesByID.isEmpty {
-            let allAnchors = sessionManager.allMeshAnchors()
-            anchorsToBuild = allAnchors.isEmpty ? changes.upserted : allAnchors
-        } else {
-            anchorsToBuild = changes.upserted
-        }
-
-        guard !anchorsToBuild.isEmpty else {
-            return
-        }
-
-        let material = cachedMeshMaterial ?? makeMeshMaterial(
-            renderStyle: renderStyle,
-            useWireframeLines: useWireframeLines
-        )
-        for anchor in anchorsToBuild {
-            guard let meshResource = Self.buildMeshResource(from: anchor.geometry) else {
-                continue
-            }
-            if let existingEntity = meshEntitiesByID[anchor.identifier] {
-                existingEntity.model?.mesh = meshResource
-                existingEntity.model?.materials = [material]
-                existingEntity.transform = Transform(matrix: anchor.transform)
-            } else {
-                let modelEntity = ModelEntity(mesh: meshResource, materials: [material])
-                modelEntity.transform = Transform(matrix: anchor.transform)
-                meshRootEntity.addChild(modelEntity)
-                meshEntitiesByID[anchor.identifier] = modelEntity
-            }
-        }
-    }
-
-    func updateMeshMaterials(renderStyle: MeshRenderStyle, useWireframeLines: Bool) {
-        guard renderStyle != activeMeshStyle || useWireframeLines != activeUseWireframeLines else {
-            return
-        }
+    /// Uses ARView's built-in Metal hardware scene-understanding overlay rather than
+    /// duplicating `ARMeshAnchor` geometry buffers in RealityKit on every frame.
+    func applyHardwareMeshStyle(_ renderStyle: MeshRenderStyle, on arView: ARView) {
+        guard renderStyle != activeMeshStyle else { return }
         activeMeshStyle = renderStyle
-        activeUseWireframeLines = useWireframeLines
-        let material = makeMeshMaterial(renderStyle: renderStyle, useWireframeLines: useWireframeLines)
-        cachedMeshMaterial = material
-        for entity in meshEntitiesByID.values {
-            entity.model?.materials = [material]
+
+        switch renderStyle {
+        case .wireframe:
+            arView.environment.sceneUnderstanding.options.remove(.occlusion)
+            arView.debugOptions.insert(.showSceneUnderstanding)
+        case .occlusion:
+            arView.debugOptions.remove(.showSceneUnderstanding)
+            arView.environment.sceneUnderstanding.options.insert(.occlusion)
         }
     }
 
-    func syncEquipmentMarkers(
-        items: [TrackedEquipment3D],
+    /// Renders lightweight single-sphere indicator dots for captured candidates without
+    /// spawning expensive 3D extruded `MeshResource.generateText` meshes during live capture.
+    func syncLiveDots(
+        candidates: [ObservationCandidate3D],
+        finalizedEquipment: [TrackedEquipment3D],
         focusedID: UUID?,
         useBillboardComponent: Bool
     ) {
-        let activeIDs = Set(items.map(\.id))
+        // Show downsampled recent candidate dots if scanning in candidate mode, or equipment dots.
+        let recentCandidates = Array(candidates.suffix(maxLiveIndicatorDots))
+        let dotEntries: [(id: UUID, position: simd_float3)] = recentCandidates.isEmpty
+            ? finalizedEquipment.prefix(maxLiveIndicatorDots).map { ($0.id, $0.worldPosition) }
+            : recentCandidates.map { ($0.id, $0.position) }
 
-        for (id, entity) in markerEntitiesByID where !activeIDs.contains(id) {
+        let activeIDs = Set(dotEntries.map(\.id))
+        for (id, entity) in candidateDotEntitiesByID where !activeIDs.contains(id) {
             entity.removeFromParent()
-            markerEntitiesByID.removeValue(forKey: id)
-            markerNodesByID.removeValue(forKey: id)
+            candidateDotEntitiesByID.removeValue(forKey: id)
         }
 
-        for item in items {
-            let isFocused = (item.id == focusedID)
-            if let existingEntity = markerEntitiesByID[item.id],
-               let existingNode = markerNodesByID[item.id] {
-                existingEntity.position = item.worldPosition
-                existingNode.update(item: item, isFocused: isFocused)
+        for entry in dotEntries {
+            if let existing = candidateDotEntitiesByID[entry.id] {
+                existing.position = entry.position
             } else {
+                let dot = ModelEntity(mesh: sharedDotMesh, materials: [sharedDotMaterial])
+                dot.position = entry.position
+                markersRootEntity.addChild(dot)
+                candidateDotEntitiesByID[entry.id] = dot
+            }
+        }
+
+        if let focusedID,
+           let focusedItem = finalizedEquipment.first(where: { $0.id == focusedID }) {
+            if focusedMarkerItemID == focusedID, let node = focusedMarkerNode {
+                node.root.position = focusedItem.worldPosition
+                node.update(item: focusedItem, isFocused: true)
+            } else {
+                focusedMarkerNode?.root.removeFromParent()
                 let node = EquipmentMarkerNode(
-                    item: item,
-                    isFocused: isFocused,
+                    item: focusedItem,
+                    isFocused: true,
                     useBillboardComponent: useBillboardComponent
                 )
                 markersRootEntity.addChild(node.root)
-                markerEntitiesByID[item.id] = node.root
-                markerNodesByID[item.id] = node
+                focusedMarkerNode = node
+                focusedMarkerItemID = focusedID
             }
+        } else {
+            focusedMarkerNode?.root.removeFromParent()
+            focusedMarkerNode = nil
+            focusedMarkerItemID = nil
         }
     }
 
     func orientMarkerLabelsToward(cameraPosition: simd_float3) {
-        guard cameraPosition.x.isFinite,
+        guard let node = focusedMarkerNode,
+              cameraPosition.x.isFinite,
               cameraPosition.y.isFinite,
               cameraPosition.z.isFinite else {
             return
         }
-        for node in markerNodesByID.values {
-            let labelWorldPos = node.labelContainer.position(relativeTo: nil)
-            guard simd_distance(cameraPosition, labelWorldPos) > 1e-4 else {
-                continue
-            }
-            if #available(iOS 18.0, *) {
-                node.labelContainer.look(
-                    at: cameraPosition,
-                    from: labelWorldPos,
-                    relativeTo: nil,
-                    forward: .positiveZ
-                )
-            } else {
-                node.labelContainer.look(
-                    at: cameraPosition,
-                    from: labelWorldPos,
-                    relativeTo: nil
-                )
-            }
+        let labelWorldPos = node.labelContainer.position(relativeTo: nil)
+        guard simd_distance(cameraPosition, labelWorldPos) > 1e-4 else {
+            return
         }
-    }
-
-    private func makeMeshMaterial(
-        renderStyle: MeshRenderStyle,
-        useWireframeLines: Bool
-    ) -> any RealityKit.Material {
-        switch renderStyle {
-        case .wireframe:
-            var material = UnlitMaterial(color: UIColor.systemCyan.withAlphaComponent(0.32))
-            material.blending = .transparent(opacity: .init(floatLiteral: 0.35))
-            if useWireframeLines, #available(iOS 18.0, *) {
-                material.triangleFillMode = .lines
-            }
-            return material
-        case .occlusion:
-            return OcclusionMaterial()
-        }
-    }
-
-    /// Safely converts ARKit `ARMeshGeometry` vertex and triangle buffers into a RealityKit `MeshResource`,
-    /// respecting buffer offsets, vertex strides, and 16-bit/32-bit index sizes.
-    static func buildMeshResource(from geometry: ARMeshGeometry) -> MeshResource? {
-        let vertexSource = geometry.vertices
-        let faceElement = geometry.faces
-
-        guard vertexSource.count > 0,
-              vertexSource.stride >= MemoryLayout<Float>.stride * 3,
-              faceElement.count > 0,
-              faceElement.primitiveType == .triangle,
-              faceElement.indexCountPerPrimitive == 3 else {
-            return nil
-        }
-
-        let totalIndices = faceElement.count * faceElement.indexCountPerPrimitive
-        let requiredVertexBytes = vertexSource.offset + (vertexSource.count - 1) * vertexSource.stride + MemoryLayout<Float>.stride * 3
-        let requiredIndexBytes = totalIndices * faceElement.bytesPerIndex
-        guard vertexSource.offset >= 0,
-              totalIndices > 0,
-              vertexSource.buffer.length >= requiredVertexBytes,
-              faceElement.buffer.length >= requiredIndexBytes else {
-            return nil
-        }
-
-        var positions: [SIMD3<Float>] = []
-        positions.reserveCapacity(vertexSource.count)
-
-        let vertexBasePtr = vertexSource.buffer.contents()
-        for i in 0..<vertexSource.count {
-            let ptr = vertexBasePtr.advanced(by: vertexSource.offset + i * vertexSource.stride)
-            let x = ptr.loadUnaligned(fromByteOffset: 0, as: Float.self)
-            let y = ptr.loadUnaligned(fromByteOffset: MemoryLayout<Float>.stride, as: Float.self)
-            let z = ptr.loadUnaligned(fromByteOffset: MemoryLayout<Float>.stride * 2, as: Float.self)
-            positions.append(SIMD3<Float>(x, y, z))
-        }
-
-        var indices: [UInt32] = []
-        indices.reserveCapacity(totalIndices)
-
-        let maxValidIndex = UInt32(vertexSource.count)
-        let indexBasePtr = faceElement.buffer.contents()
-        if faceElement.bytesPerIndex == MemoryLayout<UInt32>.size {
-            for i in 0..<totalIndices {
-                let value = indexBasePtr.loadUnaligned(
-                    fromByteOffset: i * MemoryLayout<UInt32>.stride,
-                    as: UInt32.self
-                )
-                guard value < maxValidIndex else { return nil }
-                indices.append(value)
-            }
-        } else if faceElement.bytesPerIndex == MemoryLayout<UInt16>.size {
-            for i in 0..<totalIndices {
-                let value = indexBasePtr.loadUnaligned(
-                    fromByteOffset: i * MemoryLayout<UInt16>.stride,
-                    as: UInt16.self
-                )
-                let expanded = UInt32(value)
-                guard expanded < maxValidIndex else { return nil }
-                indices.append(expanded)
-            }
+        if #available(iOS 18.0, *) {
+            node.labelContainer.look(
+                at: cameraPosition,
+                from: labelWorldPos,
+                relativeTo: nil,
+                forward: .positiveZ
+            )
         } else {
-            return nil
+            node.labelContainer.look(
+                at: cameraPosition,
+                from: labelWorldPos,
+                relativeTo: nil
+            )
         }
-
-        var descriptor = MeshDescriptor(name: "LiDARMeshChunk")
-        descriptor.positions = MeshBuffers.Positions(positions)
-        descriptor.primitives = .triangles(indices)
-        return try? MeshResource.generate(from: [descriptor])
     }
 }
 

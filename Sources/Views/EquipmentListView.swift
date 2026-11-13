@@ -2,11 +2,15 @@ import SwiftUI
 import UIKit
 import simd
 
-/// Responsive bottom drawer displaying the live roster of clustered 3D clinic equipment.
+/// Responsive bottom drawer displaying live capture telemetry during scanning
+/// or the consolidated single-identity equipment roster inside Dollhouse mode.
 public struct EquipmentListView: View {
     @ObservedObject var clusteringManager: EquipmentClusteringManager
     @ObservedObject var focusController: CameraFocusController
     let userPosition: simd_float3
+    let environmentMode: EnvironmentMode
+    let isLiveCaptureMode: Bool
+    let onInspectEquipment: ((TrackedEquipment3D) -> Void)?
 
     @State private var isExpanded: Bool = true
     @GestureState private var dragOffset: CGFloat = 0
@@ -14,11 +18,17 @@ public struct EquipmentListView: View {
     public init(
         clusteringManager: EquipmentClusteringManager,
         focusController: CameraFocusController,
-        userPosition: simd_float3
+        userPosition: simd_float3,
+        environmentMode: EnvironmentMode = .clinicalLab,
+        isLiveCaptureMode: Bool = false,
+        onInspectEquipment: ((TrackedEquipment3D) -> Void)? = nil
     ) {
         self.clusteringManager = clusteringManager
         self.focusController = focusController
         self.userPosition = userPosition
+        self.environmentMode = environmentMode
+        self.isLiveCaptureMode = isLiveCaptureMode
+        self.onInspectEquipment = onInspectEquipment
     }
 
     private var sortedEquipment: [TrackedEquipment3D] {
@@ -61,11 +71,20 @@ public struct EquipmentListView: View {
                 .padding(.top, 10)
 
             HStack(spacing: 10) {
-                Label("Detected Equipment", systemImage: "viewfinder")
+                Label(
+                    isLiveCaptureMode
+                        ? "Spatial Capture"
+                        : (environmentMode == .clinicalLab ? "Clinical Assets" : "Detected Objects"),
+                    systemImage: isLiveCaptureMode ? "waveform.path.ecg.rectangle" : "viewfinder"
+                )
                     .font(.headline)
                     .lineLimit(1)
 
-                Text("\(clusteringManager.trackedEquipment.count)")
+                Text(
+                    isLiveCaptureMode && clusteringManager.trackedEquipment.isEmpty
+                        ? "\(clusteringManager.observationCandidates.count)"
+                        : "\(clusteringManager.trackedEquipment.count)"
+                )
                     .font(.caption.weight(.bold))
                     .monospacedDigit()
                     .padding(.horizontal, 8)
@@ -144,14 +163,33 @@ public struct EquipmentListView: View {
 
     @ViewBuilder
     private var equipmentContent: some View {
-        if sortedEquipment.isEmpty {
+        if isLiveCaptureMode && sortedEquipment.isEmpty {
             VStack(spacing: 6) {
                 Image(systemName: "camera.metering.center.weighted")
                     .font(.title2)
-                    .foregroundStyle(.secondary)
-                Text("Scanning clinic space…")
+                    .foregroundStyle(.cyan)
+                Text("Capturing 3D spatial observations…")
                     .font(.subheadline.weight(.medium))
-                Text("Point the iPhone LiDAR camera at equipment (e.g. phoropter, slit lamp, autorefractor).")
+                Text(
+                    clusteringManager.observationCandidates.isEmpty
+                        ? "Sweep smoothly across the room. Heavy 3D labels & deduplication run when you Finish & Process Scan."
+                        : "\(clusteringManager.observationCandidates.count) raw samples buffered silently. Tap Finish & Process Scan to consolidate."
+                )
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .multilineTextAlignment(.center)
+            }
+            .frame(maxWidth: .infinity)
+            .padding(.vertical, 16)
+            .padding(.horizontal, 16)
+        } else if sortedEquipment.isEmpty {
+            VStack(spacing: 6) {
+                Image(systemName: "cube.transparent")
+                    .font(.title2)
+                    .foregroundStyle(.secondary)
+                Text("No Verified Assets Consolidated")
+                    .font(.subheadline.weight(.medium))
+                Text("Objects require multiple consistent keyframes before appearing as clean Dollhouse pins.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
                     .multilineTextAlignment(.center)
@@ -173,6 +211,7 @@ public struct EquipmentListView: View {
                         ) {
                             triggerSelectionHaptic()
                             focusController.focusOnEquipment(item)
+                            onInspectEquipment?(item)
                         }
                     }
                 }
@@ -199,7 +238,7 @@ public struct EquipmentListView: View {
         return String(format: "%.2f m", meters)
     }
 
-    /// Maps detected medical/lab equipment labels to SF Symbols.
+    /// Maps detected medical/lab and household equipment labels to SF Symbols.
     nonisolated public static func symbolName(for label: String) -> String {
         let normalized = label.lowercased()
         if normalized.contains("drawer") || normalized.contains("cabinet") {
@@ -210,8 +249,28 @@ public struct EquipmentListView: View {
             return "eye"
         } else if normalized.contains("monitor") || normalized.contains("desktop") || normalized.contains("computer") {
             return "desktopcomputer"
-        } else if normalized.contains("chair") {
+        } else if normalized.contains("television") || normalized == "tv" {
+            return "tv"
+        } else if normalized.contains("whiteboard") {
+            return "rectangle.on.rectangle"
+        } else if normalized.contains("laptop") {
+            return "laptopcomputer"
+        } else if normalized.contains("desk") || normalized.contains("table") {
+            return "table.furniture"
+        } else if normalized.contains("chair") || normalized.contains("stool") || normalized.contains("sofa") || normalized.contains("couch") {
             return "chair.lounge"
+        } else if normalized.contains("defibrillator") {
+            return "bolt.heart"
+        } else if normalized.contains("sharps") || normalized.contains("biohazard") {
+            return "cross.case"
+        } else if normalized.contains("bottle") || normalized.contains("cup") || normalized.contains("mug") {
+            return "cup.and.saucer"
+        } else if normalized.contains("door") {
+            return "door.left.hand.open"
+        } else if normalized.contains("sink") {
+            return "sink"
+        } else if normalized.contains("light") {
+            return "lightbulb"
         }
         return "cube.transparent"
     }

@@ -246,6 +246,21 @@ final class DollhouseSceneCoordinator: ObservableObject {
                 let entity = ModelEntity(mesh: mesh, materials: [material])
                 geometryRootEntity.addChild(entity)
                 submeshEntitiesByCategory[submesh.category] = entity
+
+                // Add lightweight zero-copy wireframe architectural crease overlay on iOS 18+
+                // reusing the exact same `MeshResource` buffer (zero duplicated vertex/index RAM).
+                if #available(iOS 18.0, *),
+                   submesh.category != .floor,
+                   submesh.category != .ceiling,
+                   submesh.category != .other {
+                    var creaseMaterial = UnlitMaterial(
+                        color: UIColor(white: 0.08, alpha: 0.16)
+                    )
+                    creaseMaterial.blending = .transparent(opacity: .init(floatLiteral: 0.18))
+                    creaseMaterial.triangleFillMode = .lines
+                    let creaseEntity = ModelEntity(mesh: mesh, materials: [creaseMaterial])
+                    entity.addChild(creaseEntity)
+                }
             }
         }
 
@@ -319,45 +334,48 @@ final class DollhouseSceneCoordinator: ObservableObject {
         return try? MeshResource.generate(from: [descriptor])
     }
 
-    private static func material(for category: RoomSurfaceCategory) -> SimpleMaterial {
+    private static func material(for category: RoomSurfaceCategory) -> PhysicallyBasedMaterial {
+        var mat = PhysicallyBasedMaterial()
         switch category {
         case .floor:
-            return SimpleMaterial(
-                color: UIColor(red: 0.34, green: 0.38, blue: 0.44, alpha: 1.0),
-                roughness: 0.85,
-                isMetallic: false
-            )
+            mat.baseColor = .init(tint: UIColor(red: 0.30, green: 0.34, blue: 0.40, alpha: 1.0))
+            mat.roughness = .init(floatLiteral: 0.86)
+            mat.metallic = .init(floatLiteral: 0.05)
         case .wall:
-            return SimpleMaterial(
-                color: UIColor(red: 0.84, green: 0.86, blue: 0.90, alpha: 1.0),
-                roughness: 0.92,
-                isMetallic: false
-            )
+            mat.baseColor = .init(tint: UIColor(red: 0.85, green: 0.87, blue: 0.90, alpha: 1.0))
+            mat.roughness = .init(floatLiteral: 0.94)
+            mat.metallic = .init(floatLiteral: 0.0)
+        case .table:
+            mat.baseColor = .init(tint: UIColor(red: 0.72, green: 0.56, blue: 0.39, alpha: 1.0))
+            mat.roughness = .init(floatLiteral: 0.58)
+            mat.metallic = .init(floatLiteral: 0.04)
+        case .seat:
+            mat.baseColor = .init(tint: UIColor(red: 0.35, green: 0.53, blue: 0.67, alpha: 1.0))
+            mat.roughness = .init(floatLiteral: 0.78)
+            mat.metallic = .init(floatLiteral: 0.05)
         case .furniture:
-            return SimpleMaterial(
-                color: UIColor(red: 0.68, green: 0.56, blue: 0.44, alpha: 1.0),
-                roughness: 0.72,
-                isMetallic: false
-            )
-        case .opening:
-            return SimpleMaterial(
-                color: UIColor(red: 0.44, green: 0.68, blue: 0.80, alpha: 1.0),
-                roughness: 0.35,
-                isMetallic: true
-            )
+            mat.baseColor = .init(tint: UIColor(red: 0.64, green: 0.54, blue: 0.44, alpha: 1.0))
+            mat.roughness = .init(floatLiteral: 0.72)
+            mat.metallic = .init(floatLiteral: 0.05)
+        case .door:
+            mat.baseColor = .init(tint: UIColor(red: 0.53, green: 0.40, blue: 0.30, alpha: 1.0))
+            mat.roughness = .init(floatLiteral: 0.62)
+            mat.metallic = .init(floatLiteral: 0.08)
+        case .window, .opening:
+            mat.baseColor = .init(tint: UIColor(red: 0.42, green: 0.72, blue: 0.86, alpha: 0.78))
+            mat.roughness = .init(floatLiteral: 0.22)
+            mat.metallic = .init(floatLiteral: 0.20)
+            mat.blending = .transparent(opacity: .init(floatLiteral: 0.78))
         case .ceiling:
-            return SimpleMaterial(
-                color: UIColor(red: 0.90, green: 0.91, blue: 0.94, alpha: 1.0),
-                roughness: 0.95,
-                isMetallic: false
-            )
+            mat.baseColor = .init(tint: UIColor(red: 0.92, green: 0.93, blue: 0.95, alpha: 1.0))
+            mat.roughness = .init(floatLiteral: 0.95)
+            mat.metallic = .init(floatLiteral: 0.0)
         case .other:
-            return SimpleMaterial(
-                color: UIColor(red: 0.56, green: 0.60, blue: 0.65, alpha: 1.0),
-                roughness: 0.88,
-                isMetallic: false
-            )
+            mat.baseColor = .init(tint: UIColor(red: 0.54, green: 0.58, blue: 0.64, alpha: 1.0))
+            mat.roughness = .init(floatLiteral: 0.85)
+            mat.metallic = .init(floatLiteral: 0.06)
         }
+        return mat
     }
 }
 

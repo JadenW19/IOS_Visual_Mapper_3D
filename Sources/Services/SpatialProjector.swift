@@ -151,7 +151,7 @@ public struct SpatialProjector: Sendable {
             cameraTransform.columns.3.z
         )
         let depth = simd_distance(cameraOrigin, worldPosition)
-        let estimatedWidth = Self.estimatePhysicalWidthMeters(
+        let estimatedExtent = Self.estimatePhysicalExtent3D(
             fromVisionBox: detection.boundingBox,
             depthMeters: depth,
             intrinsics: intrinsics,
@@ -163,22 +163,24 @@ public struct SpatialProjector: Sendable {
             label: detection.label,
             confidence: detection.confidence,
             worldPosition: worldPosition,
-            estimatedWidthMeters: estimatedWidth,
+            estimatedWidthMeters: estimatedExtent?.x,
+            boundingBox3DExtent: estimatedExtent,
             timestamp: timestamp
         )
     }
 
-    /// Estimates the physical horizontal width (in meters) of a Vision bounding box
-    /// at a known raycast `depthMeters` using pinhole camera intrinsics.
-    public static func estimatePhysicalWidthMeters(
+    /// Estimates physical 3D bounding extent `(width, height, depth)` in meters at raycast `depthMeters`.
+    public static func estimatePhysicalExtent3D(
         fromVisionBox boundingBox: CGRect,
         depthMeters: Float,
         intrinsics: simd_float3x3,
         imageResolution: CGSize,
         orientation: CGImagePropertyOrientation
-    ) -> Float? {
+    ) -> simd_float3? {
         guard boundingBox.size.width.isFinite,
+              boundingBox.size.height.isFinite,
               boundingBox.size.width > 0,
+              boundingBox.size.height > 0,
               depthMeters.isFinite,
               depthMeters > 0 else {
             return nil
@@ -190,23 +192,55 @@ public struct SpatialProjector: Sendable {
         let rawHeight = Float(imageResolution.height)
 
         let horizontalSpanPixels: Float
+        let verticalSpanPixels: Float
         let horizontalFocalLength: Float
+        let verticalFocalLength: Float
         switch orientation {
         case .left, .leftMirrored, .right, .rightMirrored:
             horizontalSpanPixels = rawHeight
+            verticalSpanPixels = rawWidth
             horizontalFocalLength = fy
+            verticalFocalLength = fx
         default:
             horizontalSpanPixels = rawWidth
+            verticalSpanPixels = rawHeight
             horizontalFocalLength = fx
+            verticalFocalLength = fy
         }
 
         guard horizontalSpanPixels.isFinite, horizontalSpanPixels > 0,
-              horizontalFocalLength.isFinite, horizontalFocalLength > 0 else {
+              verticalSpanPixels.isFinite, verticalSpanPixels > 0,
+              horizontalFocalLength.isFinite, horizontalFocalLength > 0,
+              verticalFocalLength.isFinite, verticalFocalLength > 0 else {
             return nil
         }
 
-        let estimated = Float(boundingBox.width) * depthMeters * (horizontalSpanPixels / horizontalFocalLength)
-        return (estimated.isFinite && estimated > 0) ? estimated : nil
+        let physicalWidth = Float(boundingBox.width) * depthMeters * (horizontalSpanPixels / horizontalFocalLength)
+        let physicalHeight = Float(boundingBox.height) * depthMeters * (verticalSpanPixels / verticalFocalLength)
+        guard physicalWidth.isFinite, physicalWidth > 0,
+              physicalHeight.isFinite, physicalHeight > 0 else {
+            return nil
+        }
+        let estimatedDepth = max(0.08, min(physicalWidth, physicalHeight) * 0.45)
+        return simd_float3(physicalWidth, physicalHeight, estimatedDepth)
+    }
+
+    /// Estimates the physical horizontal width (in meters) of a Vision bounding box
+    /// at a known raycast `depthMeters` using pinhole camera intrinsics.
+    public static func estimatePhysicalWidthMeters(
+        fromVisionBox boundingBox: CGRect,
+        depthMeters: Float,
+        intrinsics: simd_float3x3,
+        imageResolution: CGSize,
+        orientation: CGImagePropertyOrientation
+    ) -> Float? {
+        estimatePhysicalExtent3D(
+            fromVisionBox: boundingBox,
+            depthMeters: depthMeters,
+            intrinsics: intrinsics,
+            imageResolution: imageResolution,
+            orientation: orientation
+        )?.x
     }
 
     /// Computes a world-space ray `(origin, direction)` from a Vision bounding box and

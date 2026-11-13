@@ -2,6 +2,32 @@ import CoreGraphics
 import Foundation
 import simd
 
+/// Operating profile context used across UI terminology and knowledge card resolution.
+public enum EnvironmentMode: String, CaseIterable, Codable, Sendable, Identifiable, Hashable {
+    case clinicalLab = "Clinical Lab Mode"
+    case householdTest = "Household Test Mode"
+
+    public var id: String { rawValue }
+
+    public var shortTitle: String {
+        switch self {
+        case .clinicalLab:
+            return "Clinical Lab"
+        case .householdTest:
+            return "Household Test"
+        }
+    }
+
+    public var subtitle: String {
+        switch self {
+        case .clinicalLab:
+            return "Hospital / Optometry simulation guidelines & FHIR/UDI telemetry"
+        case .householdTest:
+            return "Residential validation mode with spatial & ergonomic asset profiles"
+        }
+    }
+}
+
 /// Represents a 2D object detection produced by the on-device Vision / CoreML pipeline.
 /// `boundingBox` uses Vision's normalized coordinate space (`[0, 1] x [0, 1]`, bottom-left origin).
 public struct Detection2D: Sendable, Equatable, Hashable {
@@ -16,12 +42,40 @@ public struct Detection2D: Sendable, Equatable, Hashable {
     }
 }
 
-/// Represents a 3D projected detection with confidence and estimated physical width in meters.
+/// Lightweight 3D detection candidate recorded silently during live AR capture
+/// before post-scan volumetric 3D NMS and label consolidation.
+public struct ObservationCandidate3D: Identifiable, Sendable, Equatable, Hashable, Codable {
+    public let id: UUID
+    public let position: simd_float3
+    public let boundingBox3DExtent: simd_float3
+    public let label: String
+    public let confidence: Float
+    public let timestamp: Date
+
+    public init(
+        id: UUID = UUID(),
+        position: simd_float3,
+        boundingBox3DExtent: simd_float3 = simd_float3(0.3, 0.3, 0.2),
+        label: String,
+        confidence: Float,
+        timestamp: Date = Date()
+    ) {
+        self.id = id
+        self.position = position
+        self.boundingBox3DExtent = boundingBox3DExtent
+        self.label = label
+        self.confidence = confidence
+        self.timestamp = timestamp
+    }
+}
+
+/// Represents a 3D projected detection with confidence and estimated physical dimensions in meters.
 public struct ProjectedDetection3D: Sendable, Equatable {
     public let label: String
     public let confidence: Float
     public let worldPosition: simd_float3
     public let estimatedWidthMeters: Float?
+    public let boundingBox3DExtent: simd_float3
     public let timestamp: Date
 
     public init(
@@ -29,12 +83,15 @@ public struct ProjectedDetection3D: Sendable, Equatable {
         confidence: Float,
         worldPosition: simd_float3,
         estimatedWidthMeters: Float? = nil,
+        boundingBox3DExtent: simd_float3? = nil,
         timestamp: Date = Date()
     ) {
         self.label = label
         self.confidence = confidence
         self.worldPosition = worldPosition
         self.estimatedWidthMeters = estimatedWidthMeters
+        self.boundingBox3DExtent = boundingBox3DExtent
+            ?? simd_float3(estimatedWidthMeters ?? 0.3, estimatedWidthMeters ?? 0.3, 0.2)
         self.timestamp = timestamp
     }
 }
@@ -50,6 +107,22 @@ public struct TrackedEquipment3D: Identifiable, Sendable, Equatable, Hashable, C
     public var labelVotes: [String: Float]
     /// Running average estimated physical bounding width in meters, when available.
     public var estimatedWidthMeters: Float?
+    /// Running average physical 3D extent `(width, height, depth)` in meters, when available.
+    public var boundingBox3DExtent: simd_float3?
+    /// Mean detection confidence across merged observations (`[0, 1]`).
+    public var averageConfidence: Float
+
+    private enum CodingKeys: String, CodingKey {
+        case id
+        case label
+        case worldPosition
+        case lastSeen
+        case observationCount
+        case labelVotes
+        case estimatedWidthMeters
+        case boundingBox3DExtent
+        case averageConfidence
+    }
 
     public init(
         id: UUID = UUID(),
@@ -58,7 +131,9 @@ public struct TrackedEquipment3D: Identifiable, Sendable, Equatable, Hashable, C
         lastSeen: Date = Date(),
         observationCount: Int = 1,
         labelVotes: [String: Float] = [:],
-        estimatedWidthMeters: Float? = nil
+        estimatedWidthMeters: Float? = nil,
+        boundingBox3DExtent: simd_float3? = nil,
+        averageConfidence: Float = 0.85
     ) {
         self.id = id
         self.label = label
@@ -67,14 +142,33 @@ public struct TrackedEquipment3D: Identifiable, Sendable, Equatable, Hashable, C
         self.observationCount = observationCount
         self.labelVotes = labelVotes
         self.estimatedWidthMeters = estimatedWidthMeters
+        self.boundingBox3DExtent = boundingBox3DExtent
+        self.averageConfidence = averageConfidence
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        id = try container.decode(UUID.self, forKey: .id)
+        label = try container.decode(String.self, forKey: .label)
+        worldPosition = try container.decode(simd_float3.self, forKey: .worldPosition)
+        lastSeen = try container.decode(Date.self, forKey: .lastSeen)
+        observationCount = try container.decode(Int.self, forKey: .observationCount)
+        labelVotes = try container.decodeIfPresent([String: Float].self, forKey: .labelVotes) ?? [:]
+        estimatedWidthMeters = try container.decodeIfPresent(Float.self, forKey: .estimatedWidthMeters)
+        boundingBox3DExtent = try container.decodeIfPresent(simd_float3.self, forKey: .boundingBox3DExtent)
+        averageConfidence = try container.decodeIfPresent(Float.self, forKey: .averageConfidence) ?? 0.85
     }
 }
 
-/// Architectural surface categories used for Dollhouse 3D shading and ceiling culling.
+/// Architectural surface categories used for Dollhouse 3D PBR shading and ceiling culling.
 public enum RoomSurfaceCategory: String, Codable, Sendable, CaseIterable, Hashable {
     case floor
     case wall
+    case table
+    case seat
     case furniture
+    case door
+    case window
     case opening
     case ceiling
     case other
@@ -144,16 +238,30 @@ public struct SavedRoomScanMetadata: Identifiable, Codable, Sendable, Equatable,
     public let id: UUID
     public var name: String
     public let createdAt: Date
+    public var environmentMode: EnvironmentMode
     public var equipment: [TrackedEquipment3D]
     public let boundsMin: SIMD3<Float>
     public let boundsMax: SIMD3<Float>
     public let vertexCount: Int
     public let triangleCount: Int
 
+    private enum CodingKeys: String, CodingKey {
+        case id
+        case name
+        case createdAt
+        case environmentMode
+        case equipment
+        case boundsMin
+        case boundsMax
+        case vertexCount
+        case triangleCount
+    }
+
     public init(
         id: UUID = UUID(),
         name: String,
         createdAt: Date = Date(),
+        environmentMode: EnvironmentMode = .clinicalLab,
         equipment: [TrackedEquipment3D],
         boundsMin: SIMD3<Float>,
         boundsMax: SIMD3<Float>,
@@ -163,11 +271,71 @@ public struct SavedRoomScanMetadata: Identifiable, Codable, Sendable, Equatable,
         self.id = id
         self.name = name
         self.createdAt = createdAt
+        self.environmentMode = environmentMode
         self.equipment = equipment
         self.boundsMin = boundsMin
         self.boundsMax = boundsMax
         self.vertexCount = vertexCount
         self.triangleCount = triangleCount
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        id = try container.decode(UUID.self, forKey: .id)
+        name = try container.decode(String.self, forKey: .name)
+        createdAt = try container.decode(Date.self, forKey: .createdAt)
+        environmentMode = try container.decodeIfPresent(EnvironmentMode.self, forKey: .environmentMode) ?? .clinicalLab
+        equipment = try container.decode([TrackedEquipment3D].self, forKey: .equipment)
+        boundsMin = try container.decode(SIMD3<Float>.self, forKey: .boundsMin)
+        boundsMax = try container.decode(SIMD3<Float>.self, forKey: .boundsMax)
+        vertexCount = try container.decode(Int.self, forKey: .vertexCount)
+        triangleCount = try container.decode(Int.self, forKey: .triangleCount)
+    }
+}
+
+/// Origin of an equipment intelligence profile (offline bundle vs live enterprise/LLM endpoint).
+public enum KnowledgeSource: String, Codable, Sendable, Equatable {
+    case offlineKnowledgeBase = "Offline Knowledge Base"
+    case cloudLiveAPI = "Aunty.cloud Live Intelligence"
+}
+
+/// Rich clinical / functional profile surfaced when inspecting a 3D asset in Dollhouse mode,
+/// including HL7/FHIR and UDI fields for enterprise hospital EHR/IoT integration.
+public struct EquipmentIntelligenceProfile: Identifiable, Codable, Sendable, Equatable {
+    public var id: String { canonicalLabel }
+    public let canonicalLabel: String
+    public let displayName: String
+    public let category: String
+    public let clinicalOrFunctionalSummary: String
+    public let operationalGuidelines: String
+    public let maintenanceOrSafetyNotes: String
+    public let assetTagID: String
+    public let fhirDeviceCode: String
+    public let udibaBarcode: String
+    public let source: KnowledgeSource
+
+    public init(
+        canonicalLabel: String,
+        displayName: String,
+        category: String,
+        clinicalOrFunctionalSummary: String,
+        operationalGuidelines: String,
+        maintenanceOrSafetyNotes: String,
+        assetTagID: String,
+        fhirDeviceCode: String,
+        udibaBarcode: String,
+        source: KnowledgeSource = .offlineKnowledgeBase
+    ) {
+        self.canonicalLabel = canonicalLabel
+        self.displayName = displayName
+        self.category = category
+        self.clinicalOrFunctionalSummary = clinicalOrFunctionalSummary
+        self.operationalGuidelines = operationalGuidelines
+        self.maintenanceOrSafetyNotes = maintenanceOrSafetyNotes
+        self.assetTagID = assetTagID
+        self.fhirDeviceCode = fhirDeviceCode
+        self.udibaBarcode = udibaBarcode
+        self.source = source
     }
 }
 
