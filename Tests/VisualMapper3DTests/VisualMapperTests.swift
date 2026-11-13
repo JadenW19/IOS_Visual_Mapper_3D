@@ -770,7 +770,6 @@ final class VisualMapperTests: XCTestCase {
             TrackedEquipment3D(
                 label: "monitor",
                 worldPosition: SIMD3<Float>(1, 1, 1),
-                confidence: 0.91,
                 observationCount: 4,
                 labelVotes: ["monitor": 3.4, "television": 0.6],
                 estimatedWidthMeters: 0.62
