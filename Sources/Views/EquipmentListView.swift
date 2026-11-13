@@ -190,14 +190,14 @@ public struct EquipmentListView: View {
     /// Maps detected medical/lab equipment labels to SF Symbols.
     nonisolated public static func symbolName(for label: String) -> String {
         let normalized = label.lowercased()
-        if normalized.contains("phoropter") || normalized.contains("lens") {
+        if normalized.contains("drawer") || normalized.contains("cabinet") {
+            return "cabinet"
+        } else if normalized.contains("phoropter") || normalized.contains("lens") {
             return "eyeglasses"
         } else if normalized.contains("slit") || normalized.contains("autorefractor") {
             return "eye"
         } else if normalized.contains("monitor") || normalized.contains("desktop") || normalized.contains("computer") {
             return "desktopcomputer"
-        } else if normalized.contains("drawer") || normalized.contains("cabinet") {
-            return "cabinet"
         } else if normalized.contains("chair") {
             return "chair.lounge"
         }
