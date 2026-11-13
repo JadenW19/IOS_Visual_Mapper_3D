@@ -35,17 +35,21 @@ public actor LocalEquipmentDetector: EquipmentDetecting {
     }
 
     /// Default minimum confidence required to retain a detection.
-    public static let defaultConfidenceThreshold: Float = 0.40
+    /// Lowered to `0.28` so smaller household/desktop items (bottles, cups, mugs)
+    /// are detected alongside larger furniture and clinical equipment.
+    public static let defaultConfidenceThreshold: Float = 0.28
 
     private struct UncheckedPixelBufferBox: @unchecked Sendable {
         let buffer: CVPixelBuffer
     }
 
     private let visionModel: VNCoreMLModel
+    private let visionRequest: VNCoreMLRequest
     public let confidenceThreshold: Float
 
     /// Initializes the detector from an explicit URL or by resolving `yolov8s-worldv2` / `yolov8s_worldv2`
     /// in the supplied bundle. Execution compute units are set to `.all` to prioritize the Apple Neural Engine.
+    /// Instantiates `VNCoreMLModel` and `VNCoreMLRequest` once for reuse across all frames.
     public init(
         modelURL: URL? = nil,
         bundle: Bundle = .main,
@@ -61,7 +65,11 @@ public actor LocalEquipmentDetector: EquipmentDetecting {
 
         do {
             let mlModel = try MLModel(contentsOf: resolvedURL, configuration: configuration)
-            self.visionModel = try VNCoreMLModel(for: mlModel)
+            let vnModel = try VNCoreMLModel(for: mlModel)
+            let request = VNCoreMLRequest(model: vnModel)
+            request.imageCropAndScaleOption = .scaleFill
+            self.visionModel = vnModel
+            self.visionRequest = request
         } catch {
             throw VisualMapperError.modelLoadFailed(error.localizedDescription)
         }
@@ -88,9 +96,6 @@ public actor LocalEquipmentDetector: EquipmentDetecting {
     ) throws -> [Detection2D] {
         try Task.checkCancellation()
 
-        let request = VNCoreMLRequest(model: visionModel)
-        request.imageCropAndScaleOption = .scaleFill
-
         let handler = VNImageRequestHandler(
             cvPixelBuffer: box.buffer,
             orientation: orientation,
@@ -98,12 +103,12 @@ public actor LocalEquipmentDetector: EquipmentDetecting {
         )
 
         do {
-            try handler.perform([request])
+            try handler.perform([visionRequest])
         } catch {
             throw VisualMapperError.visionInferenceFailed(error.localizedDescription)
         }
 
-        let observations = request.results as? [VNRecognizedObjectObservation] ?? []
+        let observations = visionRequest.results as? [VNRecognizedObjectObservation] ?? []
         return Self.parseObservations(observations, confidenceThreshold: confidenceThreshold)
     }
 

@@ -32,142 +32,54 @@ public struct RealitySceneView: View {
     }
 
     public var body: some View {
-        if #available(iOS 18.0, *) {
-            ModernRealitySceneView(
-                sessionManager: sessionManager,
-                clusteringManager: clusteringManager,
-                focusController: focusController,
-                meshRenderStyle: meshRenderStyle
-            )
-        } else {
-            LegacyARSceneView(
-                sessionManager: sessionManager,
-                clusteringManager: clusteringManager,
-                focusController: focusController,
-                meshRenderStyle: meshRenderStyle
-            )
-        }
+        ARSceneViewRepresentable(
+            sessionManager: sessionManager,
+            clusteringManager: clusteringManager,
+            focusController: focusController,
+            meshRenderStyle: meshRenderStyle
+        )
     }
 }
 
-// MARK: - iOS 18+ RealityView Implementation
+// MARK: - Unified ARView Implementation
 
-@available(iOS 18.0, *)
-private struct ModernRealitySceneView: View {
-    private struct SessionSyncTrigger: Equatable {
-        let state: ARSessionState
-        let generation: UInt64
-    }
-
+private struct ARSceneViewRepresentable: UIViewRepresentable {
     @ObservedObject var sessionManager: ARSessionManager
     @ObservedObject var clusteringManager: EquipmentClusteringManager
     @ObservedObject var focusController: CameraFocusController
     var meshRenderStyle: MeshRenderStyle
 
-    @StateObject private var coordinator = RealitySceneCoordinator()
-    @State private var trackingSession = SpatialTrackingSession()
-    @State private var hasBoundTrackingSession = false
-    @State private var boundSessionGeneration: UInt64?
-
-    var body: some View {
-        RealityView { content in
-            let shouldUseVirtual = focusController.isVirtualCameraActive
-            content.camera = shouldUseVirtual ? .virtual : .spatialTracking
-            coordinator.attachRootIfNeeded(to: content)
-            coordinator.setVirtualCameraActive(
-                shouldUseVirtual,
-                transform: focusController.virtualCameraTransform
-            )
-            coordinator.syncMeshes(from: sessionManager, renderStyle: meshRenderStyle, useWireframeLines: true)
-            coordinator.syncEquipmentMarkers(
-                items: clusteringManager.trackedEquipment,
-                focusedID: focusController.focusedItemID,
-                useBillboardComponent: true
-            )
-        } update: { content in
-            let shouldUseVirtual = focusController.isVirtualCameraActive
-            content.camera = shouldUseVirtual ? .virtual : .spatialTracking
-            coordinator.setVirtualCameraActive(
-                shouldUseVirtual,
-                transform: focusController.virtualCameraTransform
-            )
-
-            coordinator.syncMeshes(from: sessionManager, renderStyle: meshRenderStyle, useWireframeLines: true)
-            coordinator.syncEquipmentMarkers(
-                items: clusteringManager.trackedEquipment,
-                focusedID: focusController.focusedItemID,
-                useBillboardComponent: true
-            )
-        }
-        .background(focusController.isVirtualCameraActive ? Color.black : Color.clear)
-        .onChange(of: sessionManager.sessionState) { _, newState in
-            if newState != .running {
-                hasBoundTrackingSession = false
-                boundSessionGeneration = nil
-            }
-        }
-        .task(
-            id: SessionSyncTrigger(
-                state: sessionManager.sessionState,
-                generation: sessionManager.sessionRunGeneration
-            )
-        ) {
-            guard sessionManager.sessionState == .running else {
-                hasBoundTrackingSession = false
-                boundSessionGeneration = nil
-                return
-            }
-            guard !hasBoundTrackingSession || boundSessionGeneration != sessionManager.sessionRunGeneration else {
-                return
-            }
-            hasBoundTrackingSession = true
-            boundSessionGeneration = sessionManager.sessionRunGeneration
-            let spatialConfig = SpatialTrackingSession.Configuration(
-                tracking: [.world, .plane],
-                sceneUnderstanding: [],
-                camera: .back
-            )
-            _ = await trackingSession.run(spatialConfig)
-        }
-        .onChange(of: sessionManager.meshRevision) { _, _ in
-            coordinator.syncMeshes(from: sessionManager, renderStyle: meshRenderStyle, useWireframeLines: true)
-        }
-        .onChange(of: meshRenderStyle) { _, newStyle in
-            coordinator.updateMeshMaterials(renderStyle: newStyle, useWireframeLines: true)
-        }
-    }
-}
-
-// MARK: - iOS 17 Fallback ARView Implementation
-
-private struct LegacyARSceneView: UIViewRepresentable {
-    @ObservedObject var sessionManager: ARSessionManager
-    @ObservedObject var clusteringManager: EquipmentClusteringManager
-    @ObservedObject var focusController: CameraFocusController
-    var meshRenderStyle: MeshRenderStyle
-
-    func makeCoordinator() -> LegacyCoordinator {
-        LegacyCoordinator()
+    func makeCoordinator() -> ARViewCoordinator {
+        ARViewCoordinator()
     }
 
     func makeUIView(context: Context) -> ARView {
         let arView = ARView(frame: .zero)
+        arView.cameraMode = .ar
         arView.automaticallyConfigureSession = false
         arView.session = sessionManager.session
+        arView.environment.background = .cameraFeed()
 
         let rootAnchor = AnchorEntity(world: matrix_identity_float4x4)
         arView.scene.addAnchor(rootAnchor)
         rootAnchor.addChild(context.coordinator.sceneCoordinator.rootEntity)
 
+        let supportsWireframeLines: Bool
+        if #available(iOS 18.0, *) {
+            supportsWireframeLines = true
+        } else {
+            supportsWireframeLines = false
+        }
+
         context.coordinator.sceneCoordinator.syncMeshes(
             from: sessionManager,
             renderStyle: meshRenderStyle,
-            useWireframeLines: false
+            useWireframeLines: supportsWireframeLines
         )
         context.coordinator.sceneCoordinator.syncEquipmentMarkers(
             items: clusteringManager.trackedEquipment,
             focusedID: focusController.focusedItemID,
-            useBillboardComponent: false
+            useBillboardComponent: supportsWireframeLines
         )
 
         context.coordinator.observeFrameUpdates(
@@ -184,7 +96,16 @@ private struct LegacyARSceneView: UIViewRepresentable {
         let targetMode: ARView.CameraMode = shouldUseVirtual ? .nonAR : .ar
         if uiView.cameraMode != targetMode {
             uiView.cameraMode = targetMode
+            uiView.environment.background = shouldUseVirtual ? .color(.black) : .cameraFeed()
         }
+
+        let supportsWireframeLines: Bool
+        if #available(iOS 18.0, *) {
+            supportsWireframeLines = true
+        } else {
+            supportsWireframeLines = false
+        }
+
         sceneCoord.setVirtualCameraActive(
             shouldUseVirtual,
             transform: focusController.virtualCameraTransform
@@ -192,18 +113,21 @@ private struct LegacyARSceneView: UIViewRepresentable {
         sceneCoord.syncMeshes(
             from: sessionManager,
             renderStyle: meshRenderStyle,
-            useWireframeLines: false
+            useWireframeLines: supportsWireframeLines
         )
         sceneCoord.syncEquipmentMarkers(
             items: clusteringManager.trackedEquipment,
             focusedID: focusController.focusedItemID,
-            useBillboardComponent: false
+            useBillboardComponent: supportsWireframeLines
         )
-        sceneCoord.updateMeshMaterials(renderStyle: meshRenderStyle, useWireframeLines: false)
+        sceneCoord.updateMeshMaterials(
+            renderStyle: meshRenderStyle,
+            useWireframeLines: supportsWireframeLines
+        )
     }
 
     @MainActor
-    final class LegacyCoordinator {
+    final class ARViewCoordinator {
         let sceneCoordinator = RealitySceneCoordinator()
         private var frameSubscription: (any Cancellable)?
 
@@ -212,6 +136,10 @@ private struct LegacyARSceneView: UIViewRepresentable {
             sessionManager: ARSessionManager,
             focusController: CameraFocusController
         ) {
+            if #available(iOS 18.0, *) {
+                // iOS 18+ markers use BillboardComponent directly.
+                return
+            }
             frameSubscription = arView.scene.subscribe(to: SceneEvents.Update.self) { [weak self, weak sessionManager, weak focusController] _ in
                 MainActor.assumeIsolated {
                     guard let self, let sessionManager, let focusController else { return }
@@ -234,8 +162,8 @@ final class RealitySceneCoordinator: ObservableObject {
     let markersRootEntity = Entity()
     let virtualCameraEntity = PerspectiveCamera()
 
-    private var isAttached = false
     private var meshEntitiesByID: [UUID: ModelEntity] = [:]
+    private var markerEntitiesByID: [UUID: Entity] = [:]
     private var markerNodesByID: [UUID: EquipmentMarkerNode] = [:]
     private var activeMeshStyle: MeshRenderStyle?
     private var activeUseWireframeLines: Bool?
@@ -262,13 +190,6 @@ final class RealitySceneCoordinator: ObservableObject {
                 virtualCameraEntity.removeFromParent()
             }
         }
-    }
-
-    @available(iOS 18.0, *)
-    func attachRootIfNeeded(to content: RealityViewCameraContent) {
-        guard !isAttached else { return }
-        content.add(rootEntity)
-        isAttached = true
     }
 
     func syncMeshes(
@@ -342,20 +263,18 @@ final class RealitySceneCoordinator: ObservableObject {
     ) {
         let activeIDs = Set(items.map(\.id))
 
-        for (id, node) in markerNodesByID where !activeIDs.contains(id) {
-            node.root.removeFromParent()
+        for (id, entity) in markerEntitiesByID where !activeIDs.contains(id) {
+            entity.removeFromParent()
+            markerEntitiesByID.removeValue(forKey: id)
             markerNodesByID.removeValue(forKey: id)
         }
 
         for item in items {
             let isFocused = (item.id == focusedID)
-            if let existing = markerNodesByID[item.id] {
-                existing.root.position = item.worldPosition
-                existing.updateAppearance(
-                    label: item.label,
-                    observationCount: item.observationCount,
-                    isFocused: isFocused
-                )
+            if let existingEntity = markerEntitiesByID[item.id],
+               let existingNode = markerNodesByID[item.id] {
+                existingEntity.position = item.worldPosition
+                existingNode.updateFocusState(isFocused: isFocused)
             } else {
                 let node = EquipmentMarkerNode(
                     item: item,
@@ -363,6 +282,7 @@ final class RealitySceneCoordinator: ObservableObject {
                     useBillboardComponent: useBillboardComponent
                 )
                 markersRootEntity.addChild(node.root)
+                markerEntitiesByID[item.id] = node.root
                 markerNodesByID[item.id] = node
             }
         }
@@ -402,8 +322,8 @@ final class RealitySceneCoordinator: ObservableObject {
     ) -> any RealityKit.Material {
         switch renderStyle {
         case .wireframe:
-            var material = UnlitMaterial(color: UIColor.systemCyan.withAlphaComponent(0.5))
-            material.blending = .transparent(opacity: .init(floatLiteral: 1.0))
+            var material = UnlitMaterial(color: UIColor.systemCyan.withAlphaComponent(0.32))
+            material.blending = .transparent(opacity: .init(floatLiteral: 0.35))
             if useWireframeLines, #available(iOS 18.0, *) {
                 material.triangleFillMode = .lines
             }
@@ -534,16 +454,7 @@ private final class EquipmentMarkerNode {
         applyFocusScale(isFocused: isFocused)
     }
 
-    func updateAppearance(label: String, observationCount: Int, isFocused: Bool) {
-        let newTitle = Self.formatTitle(label: label, count: observationCount)
-        if newTitle != currentTitle {
-            currentTitle = newTitle
-            let newMesh = Self.makeTextMesh(title: newTitle)
-            textEntity.model?.mesh = newMesh
-            backdropEntity.model?.mesh = Self.makeBackdropMesh(for: newMesh)
-            Self.centerText(textEntity, backdrop: backdropEntity)
-        }
-
+    func updateFocusState(isFocused: Bool) {
         if isFocused != currentFocused {
             currentFocused = isFocused
             sphereEntity.model?.materials = [UnlitMaterial(color: isFocused ? .systemYellow : .systemTeal)]
@@ -563,8 +474,8 @@ private final class EquipmentMarkerNode {
         sphereEntity.scale = SIMD3<Float>(repeating: scale)
     }
 
-    private static func formatTitle(label: String, count: Int) -> String {
-        "\(label.capitalized) (\(count))"
+    private static func formatTitle(label: String, count _: Int) -> String {
+        label.capitalized
     }
 
     private static func makeTextMesh(title: String) -> MeshResource {

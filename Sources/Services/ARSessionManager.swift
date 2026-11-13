@@ -18,8 +18,8 @@ public struct KeyframeThrottlePolicy: Sendable, Equatable {
     public private(set) var lastKeyframeTimestamp: TimeInterval?
     public private(set) var lastKeyframePosition: simd_float3?
 
-    public init(timeInterval: TimeInterval = 1.25, translationThreshold: Float = 0.25) {
-        self.timeInterval = min(max(timeInterval, 1.0), 1.5)
+    public init(timeInterval: TimeInterval = 0.75, translationThreshold: Float = 0.25) {
+        self.timeInterval = max(0.25, timeInterval)
         self.translationThreshold = max(0.0, translationThreshold)
     }
 
@@ -91,11 +91,14 @@ public final class ARSessionManager: NSObject, ObservableObject {
         let value: Value
     }
 
-    /// Holds a single in-flight frame and session reference during active keyframe processing.
-    /// `isInferenceInFlight` guarantees at most one keyframe is ever retained concurrently.
-    private struct UncheckedFrameContext: @unchecked Sendable {
-        let frame: ARFrame
-        let session: ARSession
+    /// Holds only the synchronously extracted `CVPixelBuffer` and scalar camera pose/intrinsics
+    /// for a single keyframe—never retaining `ARFrame` across async boundaries.
+    private struct ExtractedFramePayload: @unchecked Sendable {
+        let pixelBuffer: CVPixelBuffer
+        let cameraTransform: simd_float4x4
+        let intrinsics: simd_float3x3
+        let imageResolution: CGSize
+        let imageOrientation: CGImagePropertyOrientation
     }
 
     @Published public private(set) var sessionState: ARSessionState = .idle
@@ -119,6 +122,7 @@ public final class ARSessionManager: NSObject, ObservableObject {
     private weak var clusteringManager: EquipmentClusteringManager?
     private var inferenceTask: Task<Void, Never>?
     private var activeInferenceID: UUID?
+    private var isProcessingFrame: Bool = false
 
     public static var isLiDARSupported: Bool {
         ARWorldTrackingConfiguration.isSupported &&
@@ -196,6 +200,7 @@ public final class ARSessionManager: NSObject, ObservableObject {
         activeInferenceID = nil
         inferenceTask?.cancel()
         inferenceTask = nil
+        isProcessingFrame = false
         isInferenceInFlight = false
         session.pause()
         if case .running = sessionState {
@@ -209,6 +214,7 @@ public final class ARSessionManager: NSObject, ObservableObject {
         activeInferenceID = nil
         inferenceTask?.cancel()
         inferenceTask = nil
+        isProcessingFrame = false
         isInferenceInFlight = false
         clusteringManager?.clearAll()
         await startSession(resetTracking: true)
@@ -301,6 +307,10 @@ public final class ARSessionManager: NSObject, ObservableObject {
             currentCameraPosition = cameraPos
         }
 
+        guard !isProcessingFrame else {
+            return
+        }
+
         guard case .normal = frame.camera.trackingState else {
             return
         }
@@ -310,75 +320,110 @@ public final class ARSessionManager: NSObject, ObservableObject {
         guard throttlePolicy.shouldEmitKeyframe(
             timestamp: frame.timestamp,
             cameraPosition: cameraPos,
-            isInferenceInFlight: isInferenceInFlight
+            isInferenceInFlight: isProcessingFrame
         ) else {
             return
         }
 
+        // Synchronously extract pixel buffer and camera pose/intrinsics so `ARFrame`
+        // is released immediately when `session(_:didUpdate:)` returns.
         let imageOrientation = Self.rearCameraVisionOrientation(for: currentInterfaceOrientation())
-        let context = UncheckedFrameContext(frame: frame, session: session)
+        let payload = ExtractedFramePayload(
+            pixelBuffer: frame.capturedImage,
+            cameraTransform: transform,
+            intrinsics: frame.camera.intrinsics,
+            imageResolution: frame.camera.imageResolution,
+            imageOrientation: imageOrientation
+        )
+
         let inferenceID = UUID()
         activeInferenceID = inferenceID
+        isProcessingFrame = true
         isInferenceInFlight = true
 
-        inferenceTask = Task { @MainActor [weak self] in
-            guard let self else { return }
-            defer {
-                if self.activeInferenceID == inferenceID {
-                    self.activeInferenceID = nil
-                    self.isInferenceInFlight = false
-                    self.inferenceTask = nil
-                }
-            }
-
+        inferenceTask = Task.detached(priority: .userInitiated) { [weak self, detector] in
             do {
                 let detections = try await Self.runDetection(
                     detector: detector,
-                    context: context,
-                    orientation: imageOrientation
+                    payload: payload
                 )
 
-                guard !Task.isCancelled else { return }
-
-                let projectionOrientation: CGImagePropertyOrientation = (detector is LocalEquipmentDetector)
-                    ? imageOrientation
-                    : .up
-
-                let timestamp = Date()
-                for detection in detections {
-                    if let worldPos = self.projector.project(
-                        detection: detection,
-                        in: context.frame,
-                        session: context.session,
-                        imageOrientation: projectionOrientation
-                    ) {
-                        self.clusteringManager?.registerDetection(
-                            label: detection.label,
-                            worldPosition: worldPos,
-                            timestamp: timestamp
-                        )
-                    }
+                guard !Task.isCancelled else {
+                    await self?.finishInference(id: inferenceID)
+                    return
                 }
+
+                await self?.completeDetection(
+                    detections,
+                    payload: payload,
+                    isLocalDetector: detector is LocalEquipmentDetector,
+                    inferenceID: inferenceID
+                )
             } catch is CancellationError {
-                return
+                await self?.finishInference(id: inferenceID)
             } catch {
-                self.trackingStatusMessage = "Detection warning: \(error.localizedDescription)"
+                await self?.failInference(message: error.localizedDescription, id: inferenceID)
             }
         }
     }
 
+    private func completeDetection(
+        _ detections: [Detection2D],
+        payload: ExtractedFramePayload,
+        isLocalDetector: Bool,
+        inferenceID: UUID
+    ) {
+        defer { finishInference(id: inferenceID) }
+        guard activeInferenceID == inferenceID else { return }
+
+        let projectionOrientation: CGImagePropertyOrientation = isLocalDetector
+            ? payload.imageOrientation
+            : .up
+
+        let timestamp = Date()
+        for detection in detections {
+            if let worldPos = projector.project(
+                detection: detection,
+                cameraTransform: payload.cameraTransform,
+                intrinsics: payload.intrinsics,
+                imageResolution: payload.imageResolution,
+                imageOrientation: projectionOrientation,
+                session: session
+            ) {
+                clusteringManager?.registerDetection(
+                    label: detection.label,
+                    worldPosition: worldPos,
+                    timestamp: timestamp
+                )
+            }
+        }
+    }
+
+    private func failInference(message: String, id: UUID) {
+        defer { finishInference(id: id) }
+        guard activeInferenceID == id else { return }
+        trackingStatusMessage = "Detection warning: \(message)"
+    }
+
+    private func finishInference(id: UUID) {
+        guard activeInferenceID == id else { return }
+        activeInferenceID = nil
+        isProcessingFrame = false
+        isInferenceInFlight = false
+        inferenceTask = nil
+    }
+
     private nonisolated static func runDetection(
         detector: any EquipmentDetecting,
-        context: UncheckedFrameContext,
-        orientation: CGImagePropertyOrientation
+        payload: ExtractedFramePayload
     ) async throws -> [Detection2D] {
         if let localDetector = detector as? LocalEquipmentDetector {
             return try await localDetector.detect(
-                pixelBuffer: context.frame.capturedImage,
-                orientation: orientation
+                pixelBuffer: payload.pixelBuffer,
+                orientation: payload.imageOrientation
             )
         }
-        return try await detector.detect(pixelBuffer: context.frame.capturedImage)
+        return try await detector.detect(pixelBuffer: payload.pixelBuffer)
     }
 
     private func handleAnchorsAdded(_ anchors: [ARAnchor]) {

@@ -56,13 +56,24 @@ final class VisualMapperTests: XCTestCase {
         let manager = EquipmentClusteringManager()
 
         manager.registerDetection(label: "slit lamp", worldPosition: simd_float3(0, 0, -1))
-        // Exactly 0.35 m away (>= 0.35 m must create a new record)
-        manager.registerDetection(label: "slit lamp", worldPosition: simd_float3(0.35, 0, -1))
+        // Exactly 0.45 m away (>= 0.45 m large-item radius must create a new record)
+        manager.registerDetection(label: "slit lamp", worldPosition: simd_float3(0.45, 0, -1))
         XCTAssertEqual(manager.trackedEquipment.count, 2)
+
+        // Small desktop items use a tighter 0.20 m radius so adjacent bottles stay distinct
+        manager.registerDetection(label: "bottle", worldPosition: simd_float3(0, 0, -1))
+        manager.registerDetection(label: "bottle", worldPosition: simd_float3(0.22, 0, -1))
+        XCTAssertEqual(manager.trackedEquipment.count, 4)
+
+        XCTAssertEqual(EquipmentClusteringManager.mergeRadius(for: "bottle"), 0.20, accuracy: 1e-6)
+        XCTAssertEqual(EquipmentClusteringManager.mergeRadius(for: "cup"), 0.20, accuracy: 1e-6)
+        XCTAssertEqual(EquipmentClusteringManager.mergeRadius(for: "desk"), 0.45, accuracy: 1e-6)
+        XCTAssertEqual(EquipmentClusteringManager.mergeRadius(for: "phoropter"), 0.45, accuracy: 1e-6)
+        XCTAssertEqual(EquipmentClusteringManager.mergeRadius(for: "monitor"), 0.35, accuracy: 1e-6)
 
         // Different label at same coordinate must create a new record
         manager.registerDetection(label: "autorefractor", worldPosition: simd_float3(0, 0, -1))
-        XCTAssertEqual(manager.trackedEquipment.count, 3)
+        XCTAssertEqual(manager.trackedEquipment.count, 5)
     }
 
     @MainActor
@@ -78,22 +89,22 @@ final class VisualMapperTests: XCTestCase {
     // MARK: - KeyframeThrottlePolicy Tests
 
     func testThrottlePolicyTimeAndTranslationBoundaries() {
-        var policy = KeyframeThrottlePolicy(timeInterval: 1.25, translationThreshold: 0.25)
+        var policy = KeyframeThrottlePolicy(timeInterval: 0.75, translationThreshold: 0.25)
 
         // First frame emits immediately
         XCTAssertTrue(policy.shouldEmitKeyframe(timestamp: 10.0, cameraPosition: .zero, isInferenceInFlight: false))
 
-        // Stationary before 1.25s -> throttled
-        XCTAssertFalse(policy.shouldEmitKeyframe(timestamp: 11.0, cameraPosition: simd_float3(0.10, 0, 0), isInferenceInFlight: false))
+        // Stationary before 0.75s -> throttled
+        XCTAssertFalse(policy.shouldEmitKeyframe(timestamp: 10.5, cameraPosition: simd_float3(0.10, 0, 0), isInferenceInFlight: false))
 
         // Inference in flight -> always throttled even when past interval and distance
         XCTAssertFalse(policy.shouldEmitKeyframe(timestamp: 15.0, cameraPosition: simd_float3(2.0, 0, 0), isInferenceInFlight: true))
 
         // Translation >= 0.25m -> emits immediately
-        XCTAssertTrue(policy.shouldEmitKeyframe(timestamp: 11.1, cameraPosition: simd_float3(0.25, 0, 0), isInferenceInFlight: false))
+        XCTAssertTrue(policy.shouldEmitKeyframe(timestamp: 10.6, cameraPosition: simd_float3(0.25, 0, 0), isInferenceInFlight: false))
 
-        // Elapsed >= 1.25s while stationary -> emits
-        XCTAssertTrue(policy.shouldEmitKeyframe(timestamp: 12.35, cameraPosition: simd_float3(0.25, 0, 0), isInferenceInFlight: false))
+        // Elapsed >= 0.75s while stationary -> emits
+        XCTAssertTrue(policy.shouldEmitKeyframe(timestamp: 11.35, cameraPosition: simd_float3(0.25, 0, 0), isInferenceInFlight: false))
 
         // Non-finite input -> rejected
         XCTAssertFalse(policy.shouldEmitKeyframe(timestamp: .nan, cameraPosition: .zero, isInferenceInFlight: false))
@@ -253,19 +264,19 @@ final class VisualMapperTests: XCTestCase {
     }
 
     func testParseObservationsThresholdAndValidation() {
-        XCTAssertEqual(LocalEquipmentDetector.defaultConfidenceThreshold, 0.40, accuracy: 1e-6)
+        XCTAssertEqual(LocalEquipmentDetector.defaultConfidenceThreshold, 0.28, accuracy: 1e-6)
         XCTAssertTrue(LocalEquipmentDetector.parseObservations([]).isEmpty)
 
         let observations: [LocalEquipmentDetector.RawObjectObservation] = [
-            // Below 0.40 threshold -> discarded
+            // Below 0.28 threshold -> discarded
             .init(
                 boundingBox: CGRect(x: 0.1, y: 0.1, width: 0.2, height: 0.2),
-                labels: [.init(identifier: "phoropter", confidence: 0.399)]
+                labels: [.init(identifier: "bottle", confidence: 0.279)]
             ),
-            // Exactly at 0.40 threshold -> retained, whitespace trimmed
+            // Exactly at 0.28 threshold -> retained, whitespace trimmed
             .init(
                 boundingBox: CGRect(x: 0.2, y: 0.2, width: 0.3, height: 0.3),
-                labels: [.init(identifier: "  slit lamp \n", confidence: 0.40)]
+                labels: [.init(identifier: "  cup \n", confidence: 0.28)]
             ),
             // Picks highest finite confidence even if not first, ignores NaN label
             .init(
@@ -296,8 +307,8 @@ final class VisualMapperTests: XCTestCase {
         let parsed = LocalEquipmentDetector.parseObservations(raw: observations)
         XCTAssertEqual(parsed.count, 2)
 
-        XCTAssertEqual(parsed[0].label, "slit lamp")
-        XCTAssertEqual(parsed[0].confidence, 0.40, accuracy: 1e-6)
+        XCTAssertEqual(parsed[0].label, "cup")
+        XCTAssertEqual(parsed[0].confidence, 0.28, accuracy: 1e-6)
         XCTAssertEqual(parsed[0].boundingBox.origin.x, 0.2, accuracy: 1e-6)
 
         XCTAssertEqual(parsed[1].label, "autorefractor")
@@ -306,19 +317,45 @@ final class VisualMapperTests: XCTestCase {
         XCTAssertEqual(parsed[1].boundingBox.maxX, 0.4, accuracy: 1e-6)
         XCTAssertEqual(parsed[1].boundingBox.maxY, 1.0, accuracy: 1e-6)
 
-        // Higher explicit threshold filters out the 0.40 item
+        // Higher explicit threshold filters out the 0.28 item
         let strictParsed = LocalEquipmentDetector.parseObservations(
             raw: observations,
             confidenceThreshold: 0.50
         )
         XCTAssertEqual(strictParsed.map(\.label), ["autorefractor"])
 
-        // Non-finite threshold falls back to default 0.40 threshold
+        // Non-finite threshold falls back to default 0.28 threshold
         let fallbackParsed = LocalEquipmentDetector.parseObservations(
             raw: observations,
             confidenceThreshold: .nan
         )
-        XCTAssertEqual(fallbackParsed.map(\.label), ["slit lamp", "autorefractor"])
+        XCTAssertEqual(fallbackParsed.map(\.label), ["cup", "autorefractor"])
+    }
+
+    func testWorldRayProjectionFromIntrinsics() throws {
+        let box = CGRect(x: 0.4, y: 0.4, width: 0.2, height: 0.2) // centered at (0.5, 0.5)
+        let intrinsics = simd_float3x3(columns: (
+            SIMD3<Float>(1000, 0, 0),
+            SIMD3<Float>(0, 1000, 0),
+            SIMD3<Float>(960, 720, 1)
+        ))
+        var cameraTransform = matrix_identity_float4x4
+        cameraTransform.columns.3 = SIMD4<Float>(1.0, 1.5, 2.0, 1.0)
+
+        let ray = try XCTUnwrap(SpatialProjector.worldRay(
+            fromVisionBox: box,
+            cameraTransform: cameraTransform,
+            intrinsics: intrinsics,
+            imageResolution: CGSize(width: 1920, height: 1440),
+            imageOrientation: .up
+        ))
+
+        XCTAssertEqual(ray.origin.x, 1.0, accuracy: 1e-5)
+        XCTAssertEqual(ray.origin.y, 1.5, accuracy: 1e-5)
+        XCTAssertEqual(ray.origin.z, 2.0, accuracy: 1e-5)
+        XCTAssertEqual(ray.direction.x, 0.0, accuracy: 1e-5)
+        XCTAssertEqual(ray.direction.y, 0.0, accuracy: 1e-5)
+        XCTAssertEqual(ray.direction.z, -1.0, accuracy: 1e-5)
     }
 
     func testBundledCoreMLModelInferenceWhenPresent() async throws {

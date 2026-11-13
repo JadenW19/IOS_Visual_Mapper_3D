@@ -3,23 +3,56 @@ import Foundation
 import simd
 
 /// `@MainActor`-isolated spatial registry that clusters 3D equipment detections
-/// using Euclidean distance merging and weighted running-average smoothing.
+/// using size-aware Euclidean distance merging and weighted running-average smoothing.
 @MainActor
 public final class EquipmentClusteringManager: ObservableObject {
-    /// Maximum Euclidean distance (in meters) within which matching-label detections merge.
+    /// Default fallback Euclidean distance (in meters) for classes outside explicit size tiers.
     nonisolated public static let defaultMergeRadiusMeters: Float = 0.35
+    /// Tighter clustering radius (0.20 m) for small desktop/handheld items so adjacent objects do not merge.
+    nonisolated public static let smallItemMergeRadiusMeters: Float = 0.20
+    /// Wider clustering radius (0.45 m) for large furniture and clinical equipment.
+    nonisolated public static let largeItemMergeRadiusMeters: Float = 0.45
+
+    nonisolated private static let smallItemKeywords: [String] = [
+        "bottle", "cup", "mug", "mouse", "keyboard", "book",
+        "pen", "mousepad", "pipette", "thermometer", "barcode scanner",
+        "telephone", "tablet", "sample tray", "gloves box"
+    ]
+
+    nonisolated private static let largeItemKeywords: [String] = [
+        "table", "desk", "chair", "sofa", "phoropter", "slit lamp",
+        "autorefractor", "lens drawer", "optometry chair", "armchair",
+        "cabinet", "filing cabinet", "shelf", "refrigerator", "whiteboard",
+        "wheelchair", "examination light", "rolling stool", "radiator", "sink", "door"
+    ]
 
     @Published public private(set) var trackedEquipment: [TrackedEquipment3D] = []
 
-    public let mergeRadiusMeters: Float
+    public let defaultMergeRadius: Float
 
     public init(mergeRadiusMeters: Float = EquipmentClusteringManager.defaultMergeRadiusMeters) {
-        self.mergeRadiusMeters = max(0.0, mergeRadiusMeters)
+        self.defaultMergeRadius = max(0.0, mergeRadiusMeters)
+    }
+
+    /// Returns the size-aware clustering radius (in meters) for a detected class label.
+    nonisolated public static func mergeRadius(
+        for label: String,
+        fallback: Float = defaultMergeRadiusMeters
+    ) -> Float {
+        let normalized = label.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        if smallItemKeywords.contains(where: { normalized.contains($0) }) {
+            return smallItemMergeRadiusMeters
+        }
+        if largeItemKeywords.contains(where: { normalized.contains($0) }) {
+            return largeItemMergeRadiusMeters
+        }
+        return max(0.0, fallback)
     }
 
     /// Registers a newly projected 3D detection.
     ///
-    /// If an existing record with a matching label is strictly closer than `mergeRadiusMeters` (0.35 m),
+    /// If an existing record with a matching label is strictly closer than the size-aware
+    /// merge radius (`0.20 m` small items, `0.45 m` large furniture/clinical machines, `0.35 m` default),
     /// its `worldPosition` is updated using an observation-weighted running average and its
     /// `observationCount` is incremented. Otherwise, a new `TrackedEquipment3D` entity is appended.
     @discardableResult
@@ -73,7 +106,7 @@ public final class EquipmentClusteringManager: ObservableObject {
 
     private func findClosestMatchingIndex(label: String, worldPosition: simd_float3) -> Int? {
         var bestIndex: Int?
-        var bestDistance = mergeRadiusMeters
+        var bestDistance = Self.mergeRadius(for: label, fallback: defaultMergeRadius)
 
         for (index, item) in trackedEquipment.enumerated() {
             guard item.label.caseInsensitiveCompare(label) == .orderedSame else {
