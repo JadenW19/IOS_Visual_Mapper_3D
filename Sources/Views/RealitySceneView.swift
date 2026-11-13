@@ -127,12 +127,7 @@ private struct ModernRealitySceneView: View {
                 sceneUnderstanding: [],
                 camera: .back
             )
-            let arConfig = sessionManager.makeWorldTrackingConfiguration()
-            _ = await trackingSession.run(
-                spatialConfig,
-                session: sessionManager.session,
-                arConfiguration: arConfig
-            )
+            _ = await trackingSession.run(spatialConfig)
         }
         .onChange(of: sessionManager.meshRevision) { _, _ in
             coordinator.syncMeshes(from: sessionManager, renderStyle: meshRenderStyle, useWireframeLines: true)
@@ -210,7 +205,7 @@ private struct LegacyARSceneView: UIViewRepresentable {
     @MainActor
     final class LegacyCoordinator {
         let sceneCoordinator = RealitySceneCoordinator()
-        private var frameSubscription: AnyCancellable?
+        private var frameSubscription: (any Cancellable)?
 
         func observeFrameUpdates(
             on arView: ARView,
@@ -384,12 +379,20 @@ final class RealitySceneCoordinator: ObservableObject {
             guard simd_distance(cameraPosition, labelWorldPos) > 1e-4 else {
                 continue
             }
-            node.labelContainer.look(
-                at: cameraPosition,
-                from: labelWorldPos,
-                relativeTo: nil,
-                forward: .positiveZ
-            )
+            if #available(iOS 18.0, *) {
+                node.labelContainer.look(
+                    at: cameraPosition,
+                    from: labelWorldPos,
+                    relativeTo: nil,
+                    forward: .positiveZ
+                )
+            } else {
+                node.labelContainer.look(
+                    at: cameraPosition,
+                    from: labelWorldPos,
+                    relativeTo: nil
+                )
+            }
         }
     }
 
