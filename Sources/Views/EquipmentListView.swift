@@ -74,7 +74,19 @@ public struct EquipmentListView: View {
 
                 Spacer()
 
-                if focusController.isVirtualCameraActive {
+                if focusController.isDollhouseOrbitEnabled && focusController.focusedItemID != nil {
+                    Button {
+                        triggerSelectionHaptic()
+                        focusController.exitFocusMode()
+                    } label: {
+                        Label("Orbit View", systemImage: "cube.transparent")
+                            .font(.caption.weight(.semibold))
+                            .padding(.horizontal, 10)
+                            .padding(.vertical, 5)
+                            .background(Color.cyan.opacity(0.24), in: Capsule())
+                    }
+                    .buttonStyle(.plain)
+                } else if !focusController.isDollhouseOrbitEnabled && focusController.isVirtualCameraActive {
                     Button {
                         triggerSelectionHaptic()
                         focusController.exitFocusMode()

@@ -274,7 +274,7 @@ final class RealitySceneCoordinator: ObservableObject {
             if let existingEntity = markerEntitiesByID[item.id],
                let existingNode = markerNodesByID[item.id] {
                 existingEntity.position = item.worldPosition
-                existingNode.updateFocusState(isFocused: isFocused)
+                existingNode.update(item: item, isFocused: isFocused)
             } else {
                 let node = EquipmentMarkerNode(
                     item: item,
@@ -407,7 +407,7 @@ final class RealitySceneCoordinator: ObservableObject {
 // MARK: - 3D Billboard Equipment Marker Node
 
 @MainActor
-private final class EquipmentMarkerNode {
+final class EquipmentMarkerNode {
     let root = Entity()
     let sphereEntity: ModelEntity
     let labelContainer = Entity()
@@ -452,6 +452,18 @@ private final class EquipmentMarkerNode {
         root.addChild(labelContainer)
 
         applyFocusScale(isFocused: isFocused)
+    }
+
+    func update(item: TrackedEquipment3D, isFocused: Bool) {
+        let updatedTitle = Self.formatTitle(label: item.label, count: item.observationCount)
+        if updatedTitle != currentTitle {
+            currentTitle = updatedTitle
+            let textMesh = Self.makeTextMesh(title: updatedTitle)
+            textEntity.model?.mesh = textMesh
+            backdropEntity.model?.mesh = Self.makeBackdropMesh(for: textMesh)
+            Self.centerText(textEntity, backdrop: backdropEntity)
+        }
+        updateFocusState(isFocused: isFocused)
     }
 
     func updateFocusState(isFocused: Bool) {

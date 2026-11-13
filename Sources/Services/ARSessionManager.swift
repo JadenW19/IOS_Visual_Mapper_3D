@@ -234,6 +234,12 @@ public final class ARSessionManager: NSObject, ObservableObject {
         Array(meshAnchorsByID.values)
     }
 
+    /// Captures thread-safe `Sendable` vertex, normal, face, and classification snapshots
+    /// synchronously on the main actor so baking can run completely off the main thread.
+    public func extractMeshSnapshots() -> [MeshAnchorSnapshot] {
+        meshAnchorsByID.values.map { MeshAnchorSnapshot.capture(from: $0) }
+    }
+
     /// Maps the current `UIInterfaceOrientation` to the `CGImagePropertyOrientation`
     /// required by Vision so the rear camera sensor buffer is evaluated upright.
     ///
@@ -382,18 +388,21 @@ public final class ARSessionManager: NSObject, ObservableObject {
 
         let timestamp = Date()
         for detection in detections {
-            if let worldPos = projector.project(
+            if let projected = projector.projectWithMetadata(
                 detection: detection,
                 cameraTransform: payload.cameraTransform,
                 intrinsics: payload.intrinsics,
                 imageResolution: payload.imageResolution,
                 imageOrientation: projectionOrientation,
-                session: session
+                session: session,
+                timestamp: timestamp
             ) {
                 clusteringManager?.registerDetection(
                     label: detection.label,
-                    worldPosition: worldPos,
-                    timestamp: timestamp
+                    confidence: projected.confidence,
+                    worldPosition: projected.worldPosition,
+                    estimatedWidthMeters: projected.estimatedWidthMeters,
+                    timestamp: projected.timestamp
                 )
             }
         }

@@ -504,4 +504,346 @@ final class VisualMapperTests: XCTestCase {
         XCTAssertEqual(clustering.equipment(withID: leftMonitor.id)?.observationCount, 1)
         XCTAssertEqual(clustering.equipment(withID: rightMonitor.id)?.observationCount, 2)
     }
+
+    // MARK: - Spatial & Multi-Frame Disambiguation Tests
+
+    func testPhysicalWidthEstimationFromIntrinsics() throws {
+        var intrinsics = matrix_identity_float3x3
+        intrinsics.columns.0 = SIMD3<Float>(1000, 0, 0) // fx = 1000
+        intrinsics.columns.1 = SIMD3<Float>(0, 1200, 0) // fy = 1200
+        intrinsics.columns.2 = SIMD3<Float>(960, 720, 1)
+
+        let landscapeBox = CGRect(x: 0.2, y: 0.2, width: 0.25, height: 0.3)
+        let landscapeWidth = try XCTUnwrap(
+            SpatialProjector.estimatePhysicalWidthMeters(
+                fromVisionBox: landscapeBox,
+                depthMeters: 2.0,
+                intrinsics: intrinsics,
+                imageResolution: CGSize(width: 1920, height: 1440),
+                orientation: .up
+            )
+        )
+        // 0.25 * 1920 / 1000 * 2.0 = 0.96 m
+        XCTAssertEqual(landscapeWidth, 0.96, accuracy: 1e-4)
+
+        let portraitBox = CGRect(x: 0.1, y: 0.1, width: 0.2, height: 0.2)
+        let portraitWidth = try XCTUnwrap(
+            SpatialProjector.estimatePhysicalWidthMeters(
+                fromVisionBox: portraitBox,
+                depthMeters: 2.0,
+                intrinsics: intrinsics,
+                imageResolution: CGSize(width: 1920, height: 1440),
+                orientation: .right
+            )
+        )
+        // Portrait uses swapped imageResolution width (1440 px) and fy (1200): 0.2 * 1440 / 1200 * 2.0 = 0.48 m
+        XCTAssertEqual(portraitWidth, 0.48, accuracy: 1e-4)
+
+        XCTAssertNil(
+            SpatialProjector.estimatePhysicalWidthMeters(
+                fromVisionBox: landscapeBox,
+                depthMeters: 0.0,
+                intrinsics: intrinsics,
+                imageResolution: CGSize(width: 1920, height: 1440),
+                orientation: .up
+            )
+        )
+    }
+
+    @MainActor
+    func testSpatialDisambiguationMonitorVsTelevisionAndDeskVsTable() throws {
+        let manager = EquipmentClusteringManager()
+
+        // 1. Physically small "television" (< 0.75 m) reclassifies immediately to "monitor".
+        let smallScreen = try XCTUnwrap(
+            manager.registerDetection(
+                label: "television",
+                confidence: 0.90,
+                worldPosition: simd_float3(0.0, 1.0, -2.0),
+                estimatedWidthMeters: 0.55
+            )
+        )
+        XCTAssertEqual(smallScreen.label, "monitor")
+
+        // 2. Large wall-mounted "television" (>= 0.75 m) away from workspace stays "television".
+        let loungeTV = try XCTUnwrap(
+            manager.registerDetection(
+                label: "television",
+                confidence: 0.90,
+                worldPosition: simd_float3(4.0, 1.4, -3.0),
+                estimatedWidthMeters: 1.25
+            )
+        )
+        XCTAssertEqual(loungeTV.label, "television")
+
+        // 3. Large "television" near a keyboard discovered *afterward* reclassifies to "monitor" too.
+        let nearWorkstationTV = try XCTUnwrap(
+            manager.registerDetection(
+                label: "television",
+                confidence: 0.85,
+                worldPosition: simd_float3(0.0, 1.0, 2.0),
+                estimatedWidthMeters: 0.80
+            )
+        )
+        XCTAssertEqual(nearWorkstationTV.label, "television")
+
+        _ = manager.registerDetection(
+            label: "keyboard",
+            confidence: 0.85,
+            worldPosition: simd_float3(0.1, 0.75, 2.2)
+        )
+        XCTAssertEqual(manager.equipment(withID: nearWorkstationTV.id)?.label, "monitor")
+
+        // 4. "table" with laptop within 0.6 m above it reclassifies to "desk"; empty table stays "table".
+        let standaloneTable = try XCTUnwrap(
+            manager.registerDetection(
+                label: "table",
+                confidence: 0.80,
+                worldPosition: simd_float3(-3.0, 0.72, -1.0)
+            )
+        )
+        let officeTable = try XCTUnwrap(
+            manager.registerDetection(
+                label: "table",
+                confidence: 0.80,
+                worldPosition: simd_float3(0.0, 0.72, 2.2)
+            )
+        )
+        XCTAssertEqual(manager.equipment(withID: standaloneTable.id)?.label, "table")
+        XCTAssertEqual(manager.equipment(withID: officeTable.id)?.label, "desk")
+    }
+
+    @MainActor
+    func testMultiFrameConfidenceVotingMergesConfusableLabels() throws {
+        let manager = EquipmentClusteringManager()
+
+        let first = try XCTUnwrap(
+            manager.registerDetection(
+                label: "cup",
+                confidence: 0.55,
+                worldPosition: simd_float3(1.0, 0.8, -1.0)
+            )
+        )
+        XCTAssertEqual(first.label, "cup")
+
+        let second = try XCTUnwrap(
+            manager.registerDetection(
+                label: "mug",
+                confidence: 0.85,
+                worldPosition: simd_float3(1.04, 0.8, -1.0)
+            )
+        )
+        XCTAssertEqual(second.id, first.id)
+        XCTAssertEqual(manager.trackedEquipment.count, 1)
+        XCTAssertEqual(second.observationCount, 2)
+        XCTAssertEqual(second.label, "mug")
+        XCTAssertEqual(second.labelVotes["cup"] ?? 0, 0.55, accuracy: 1e-4)
+        XCTAssertEqual(second.labelVotes["mug"] ?? 0, 0.85, accuracy: 1e-4)
+    }
+
+    // MARK: - RoomModelBaker & ScanStorageManager Tests
+
+    func testRoomModelBakerMergesCategoriesAndExportsOBJ() async throws {
+        let baker = RoomModelBaker()
+
+        do {
+            _ = try await baker.bake(snapshots: [])
+            XCTFail("Expected empty snapshots to throw VisualMapperError.meshBakingFailed")
+        } catch let error as VisualMapperError {
+            guard case .meshBakingFailed = error else {
+                return XCTFail("Unexpected VisualMapperError: \(error)")
+            }
+        }
+
+        func makeTriangleSnapshot(
+            positions: [SIMD3<Float>],
+            normals: [SIMD3<Float>],
+            classifications: [ARMeshClassification],
+            translation: SIMD3<Float>
+        ) -> MeshAnchorSnapshot {
+            var vertexData = Data()
+            for p in positions {
+                var x = p.x; var y = p.y; var z = p.z
+                vertexData.append(Data(bytes: &x, count: 4))
+                vertexData.append(Data(bytes: &y, count: 4))
+                vertexData.append(Data(bytes: &z, count: 4))
+            }
+            var normalData = Data()
+            for n in normals {
+                var x = n.x; var y = n.y; var z = n.z
+                normalData.append(Data(bytes: &x, count: 4))
+                normalData.append(Data(bytes: &y, count: 4))
+                normalData.append(Data(bytes: &z, count: 4))
+            }
+            var indexData = Data()
+            for idx in 0..<UInt16(positions.count) {
+                var v = idx
+                indexData.append(Data(bytes: &v, count: 2))
+            }
+            let classData = Data(classifications.map { UInt8($0.rawValue) })
+
+            var transform = matrix_identity_float4x4
+            transform.columns.3 = SIMD4<Float>(translation.x, translation.y, translation.z, 1.0)
+
+            return MeshAnchorSnapshot(
+                id: UUID(),
+                transform: transform,
+                vertexData: vertexData,
+                vertexCount: positions.count,
+                vertexStride: 12,
+                vertexOffset: 0,
+                normalData: normalData,
+                normalCount: normals.count,
+                normalStride: 12,
+                normalOffset: 0,
+                indexData: indexData,
+                faceCount: classifications.count,
+                bytesPerIndex: 2,
+                indexCountPerPrimitive: 3,
+                isTrianglePrimitive: true,
+                classificationData: classData,
+                classificationCount: classifications.count,
+                classificationStride: 1,
+                classificationOffset: 0
+            )
+        }
+
+        let floorWallSnap = makeTriangleSnapshot(
+            positions: [
+                SIMD3<Float>(0, 0, 0), SIMD3<Float>(2, 0, 0), SIMD3<Float>(0, 0, 2),
+                SIMD3<Float>(0, 0, 0), SIMD3<Float>(0, 2.5, 0), SIMD3<Float>(2, 0, 0)
+            ],
+            normals: [
+                SIMD3<Float>(0, 1, 0), SIMD3<Float>(0, 1, 0), SIMD3<Float>(0, 1, 0),
+                SIMD3<Float>(0, 0, 1), SIMD3<Float>(0, 0, 1), SIMD3<Float>(0, 0, 1)
+            ],
+            classifications: [.floor, .wall],
+            translation: SIMD3<Float>(1, 0, -1)
+        )
+
+        let ceilingSnap = makeTriangleSnapshot(
+            positions: [SIMD3<Float>(0, 2.8, 0), SIMD3<Float>(2, 2.8, 0), SIMD3<Float>(0, 2.8, 2)],
+            normals: [SIMD3<Float>(0, -1, 0), SIMD3<Float>(0, -1, 0), SIMD3<Float>(0, -1, 0)],
+            classifications: [.ceiling],
+            translation: .zero
+        )
+
+        let geometry = try await baker.bake(snapshots: [floorWallSnap, ceilingSnap])
+        XCTAssertEqual(geometry.triangleCount, 3)
+        XCTAssertEqual(geometry.vertexCount, 9)
+        XCTAssertEqual(Set(geometry.submeshes.map(\.category)), Set([.floor, .wall, .ceiling]))
+        XCTAssertEqual(geometry.boundsMin.x, 0, accuracy: 1e-4)
+        XCTAssertEqual(geometry.boundsMax.x, 3, accuracy: 1e-4)
+        XCTAssertEqual(geometry.boundsMax.y, 2.8, accuracy: 1e-4)
+
+        let objText = String(decoding: RoomModelBaker.buildOBJData(from: geometry), as: UTF8.self)
+        XCTAssertTrue(objText.contains("o DollhouseRoom"))
+        XCTAssertTrue(objText.contains("g floor"))
+        XCTAssertTrue(objText.contains("g wall"))
+        XCTAssertTrue(objText.contains("g ceiling"))
+        XCTAssertTrue(objText.contains("f "))
+    }
+
+    func testScanStorageManagerSaveListLoadAndDelete() async throws {
+        let tempDir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("VisualMapperTests_\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: tempDir) }
+
+        let storage = ScanStorageManager(baseDirectory: tempDir)
+        let initialList = try await storage.listSavedScans()
+        XCTAssertTrue(initialList.isEmpty)
+
+        let submesh = BakedSubmesh(
+            category: .floor,
+            positions: [SIMD3<Float>(0, 0, 0), SIMD3<Float>(2, 0, 0), SIMD3<Float>(0, 0, 2)],
+            normals: [SIMD3<Float>(0, 1, 0), SIMD3<Float>(0, 1, 0), SIMD3<Float>(0, 1, 0)],
+            indices: [0, 1, 2]
+        )
+        let geometry = BakedRoomGeometry(
+            submeshes: [submesh],
+            boundsMin: SIMD3<Float>(0, 0, 0),
+            boundsMax: SIMD3<Float>(2, 0, 2),
+            vertexCount: 3,
+            triangleCount: 1
+        )
+        let equipment = [
+            TrackedEquipment3D(
+                label: "monitor",
+                worldPosition: SIMD3<Float>(1, 1, 1),
+                confidence: 0.91,
+                observationCount: 4,
+                labelVotes: ["monitor": 3.4, "television": 0.6],
+                estimatedWidthMeters: 0.62
+            )
+        ]
+
+        let savedMeta = try await storage.saveScan(
+            name: "Exam Room A",
+            geometry: geometry,
+            equipment: equipment
+        )
+
+        let list = try await storage.listSavedScans()
+        XCTAssertEqual(list.count, 1)
+        XCTAssertEqual(list.first?.id, savedMeta.id)
+        XCTAssertEqual(list.first?.name, "Exam Room A")
+
+        let loaded = try await storage.loadScan(id: savedMeta.id)
+        XCTAssertEqual(loaded.geometry, geometry)
+        XCTAssertEqual(loaded.metadata.equipment.first?.label, "monitor")
+        XCTAssertEqual(loaded.metadata.equipment.first?.estimatedWidthMeters ?? 0, 0.62, accuracy: 1e-4)
+
+        let objURL = await storage.exportedOBJURL(for: savedMeta.id)
+        XCTAssertNotNil(objURL)
+        XCTAssertTrue(objURL.map { FileManager.default.fileExists(atPath: $0.path) } ?? false)
+
+        try await storage.deleteScan(id: savedMeta.id)
+        let listAfterDelete = try await storage.listSavedScans()
+        XCTAssertTrue(listAfterDelete.isEmpty)
+    }
+
+    // MARK: - Dollhouse Orbit Camera Tests
+
+    @MainActor
+    func testDollhouseOrbitPanZoomAndFocusReset() {
+        let controller = CameraFocusController()
+        controller.configureDollhouseOrbit(
+            boundsMin: SIMD3<Float>(-2, 0, -2),
+            boundsMax: SIMD3<Float>(2, 3, 2),
+            duration: 0
+        )
+
+        XCTAssertTrue(controller.isDollhouseOrbitEnabled)
+        XCTAssertTrue(controller.isVirtualCameraActive)
+        XCTAssertNil(controller.focusedItemID)
+
+        let initialYaw = controller.orbitYaw
+        let initialDist = controller.orbitDistance
+        let initialPivot = controller.orbitPivot
+
+        controller.orbitBy(deltaYaw: 0.3, deltaPitch: 5.0) // extreme pitch clamps safely
+        XCTAssertEqual(controller.orbitYaw, initialYaw + 0.3, accuracy: 1e-5)
+        XCTAssertEqual(controller.orbitPitch, CameraFocusController.maxOrbitPitch, accuracy: 1e-5)
+
+        controller.zoomBy(scaleFactor: 2.0)
+        XCTAssertEqual(controller.orbitDistance, max(initialDist * 0.5, CameraFocusController.minOrbitDistance), accuracy: 1e-4)
+
+        controller.panBy(deltaRight: 0.5, deltaUp: 0.25)
+        XCTAssertGreaterThan(simd_distance(controller.orbitPivot, initialPivot), 0.1)
+
+        let item = TrackedEquipment3D(label: "slit lamp", worldPosition: SIMD3<Float>(0.5, 1.0, -0.5))
+        controller.focusOnEquipment(item, duration: 0)
+        XCTAssertEqual(controller.focusedItemID, item.id)
+        XCTAssertTrue(controller.isVirtualCameraActive)
+
+        // Exiting focus in Dollhouse mode keeps virtual camera active and clears focusedItemID
+        controller.exitFocusMode()
+        XCTAssertNil(controller.focusedItemID)
+        XCTAssertTrue(controller.isVirtualCameraActive)
+        XCTAssertTrue(controller.isDollhouseOrbitEnabled)
+
+        controller.disableDollhouseOrbit()
+        XCTAssertFalse(controller.isDollhouseOrbitEnabled)
+        XCTAssertFalse(controller.isVirtualCameraActive)
+    }
 }

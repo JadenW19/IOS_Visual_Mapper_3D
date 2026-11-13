@@ -123,6 +123,92 @@ public struct SpatialProjector: Sendable {
         )
     }
 
+    /// Projects a 2D Vision detection into 3D world space and estimates its physical width
+    /// in meters at the raycast depth using the oriented camera focal length.
+    public func projectWithMetadata(
+        detection: Detection2D,
+        cameraTransform: simd_float4x4,
+        intrinsics: simd_float3x3,
+        imageResolution: CGSize,
+        imageOrientation: CGImagePropertyOrientation,
+        session: ARSession,
+        timestamp: Date = Date()
+    ) -> ProjectedDetection3D? {
+        guard let worldPosition = project(
+            detection: detection,
+            cameraTransform: cameraTransform,
+            intrinsics: intrinsics,
+            imageResolution: imageResolution,
+            imageOrientation: imageOrientation,
+            session: session
+        ) else {
+            return nil
+        }
+
+        let cameraOrigin = simd_float3(
+            cameraTransform.columns.3.x,
+            cameraTransform.columns.3.y,
+            cameraTransform.columns.3.z
+        )
+        let depth = simd_distance(cameraOrigin, worldPosition)
+        let estimatedWidth = Self.estimatePhysicalWidthMeters(
+            fromVisionBox: detection.boundingBox,
+            depthMeters: depth,
+            intrinsics: intrinsics,
+            imageResolution: imageResolution,
+            orientation: imageOrientation
+        )
+
+        return ProjectedDetection3D(
+            label: detection.label,
+            confidence: detection.confidence,
+            worldPosition: worldPosition,
+            estimatedWidthMeters: estimatedWidth,
+            timestamp: timestamp
+        )
+    }
+
+    /// Estimates the physical horizontal width (in meters) of a Vision bounding box
+    /// at a known raycast `depthMeters` using pinhole camera intrinsics.
+    public static func estimatePhysicalWidthMeters(
+        fromVisionBox boundingBox: CGRect,
+        depthMeters: Float,
+        intrinsics: simd_float3x3,
+        imageResolution: CGSize,
+        orientation: CGImagePropertyOrientation
+    ) -> Float? {
+        guard boundingBox.size.width.isFinite,
+              boundingBox.size.width > 0,
+              depthMeters.isFinite,
+              depthMeters > 0 else {
+            return nil
+        }
+
+        let fx = intrinsics[0][0]
+        let fy = intrinsics[1][1]
+        let rawWidth = Float(imageResolution.width)
+        let rawHeight = Float(imageResolution.height)
+
+        let horizontalSpanPixels: Float
+        let horizontalFocalLength: Float
+        switch orientation {
+        case .left, .leftMirrored, .right, .rightMirrored:
+            horizontalSpanPixels = rawHeight
+            horizontalFocalLength = fy
+        default:
+            horizontalSpanPixels = rawWidth
+            horizontalFocalLength = fx
+        }
+
+        guard horizontalSpanPixels.isFinite, horizontalSpanPixels > 0,
+              horizontalFocalLength.isFinite, horizontalFocalLength > 0 else {
+            return nil
+        }
+
+        let estimated = Float(boundingBox.width) * depthMeters * (horizontalSpanPixels / horizontalFocalLength)
+        return (estimated.isFinite && estimated > 0) ? estimated : nil
+    }
+
     /// Computes a world-space ray `(origin, direction)` from a Vision bounding box and
     /// camera intrinsics/transform without retaining an `ARFrame`.
     public static func worldRay(

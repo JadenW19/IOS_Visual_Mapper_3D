@@ -11,11 +11,25 @@ public final class CameraFocusController: ObservableObject {
 
     @Published public private(set) var focusedItemID: UUID?
     @Published public private(set) var isVirtualCameraActive: Bool = false
+    @Published public private(set) var isDollhouseOrbitEnabled: Bool = false
     @Published public private(set) var virtualCameraTransform: Transform = .identity
     @Published public private(set) var currentLookAtTarget: simd_float3 = .zero
+    @Published public private(set) var orbitPivot: simd_float3 = .zero
+    @Published public private(set) var orbitYaw: Float = 0.785398
+    @Published public private(set) var orbitPitch: Float = 0.62
+    @Published public private(set) var orbitDistance: Float = 4.5
 
+    private var defaultOrbitPivot: simd_float3 = .zero
+    private var defaultOrbitDistance: Float = 4.5
     private var animationTask: Task<Void, Never>?
     private var activeCameraTransformProvider: @MainActor () -> simd_float4x4
+
+    nonisolated public static let defaultOrbitYaw: Float = 0.785398
+    nonisolated public static let defaultOrbitPitch: Float = 0.62
+    nonisolated public static let minOrbitPitch: Float = 0.08
+    nonisolated public static let maxOrbitPitch: Float = 1.48
+    nonisolated public static let minOrbitDistance: Float = 0.5
+    nonisolated public static let maxOrbitDistance: Float = 35.0
 
     public init(cameraTransformProvider: @MainActor @escaping () -> simd_float4x4 = { matrix_identity_float4x4 }) {
         self.activeCameraTransformProvider = cameraTransformProvider
@@ -56,12 +70,201 @@ public final class CameraFocusController: ObservableObject {
 
         focusedItemID = item.id
         isVirtualCameraActive = true
+        animateCamera(
+            from: startTransformMatrix,
+            to: endTransformMatrix,
+            lookAtStart: startLookAt,
+            lookAtEnd: targetLookAt,
+            duration: duration
+        )
+    }
+
+    /// Configures Dollhouse 3D orbit bounds around a baked room and positions the virtual camera
+    /// at an elevated isometric estate-agent overview.
+    public func configureDollhouseOrbit(
+        boundsMin: simd_float3,
+        boundsMax: simd_float3,
+        duration: TimeInterval = 0.0
+    ) {
+        let center = (boundsMin + boundsMax) * 0.5
+        let extentRadius = max(0.75, simd_length(boundsMax - boundsMin) * 0.5)
+        let idealDistance = min(
+            Self.maxOrbitDistance,
+            max(2.0, extentRadius * 2.15)
+        )
+
+        defaultOrbitPivot = center
+        defaultOrbitDistance = idealDistance
+
+        isDollhouseOrbitEnabled = true
+        isVirtualCameraActive = true
+        focusedItemID = nil
+
+        resetToDollhouseOrbit(duration: duration)
+    }
+
+    /// Smoothly returns to the home Dollhouse orbit framing (or immediately if `duration <= 0`).
+    public func resetToDollhouseOrbit(duration: TimeInterval = 0.6) {
+        guard isDollhouseOrbitEnabled else { return }
+
+        let startMatrix = virtualCameraTransform.matrix
+        let startLookAt = currentLookAtTarget
+
+        orbitPivot = defaultOrbitPivot
+        orbitYaw = Self.defaultOrbitYaw
+        orbitPitch = Self.defaultOrbitPitch
+        orbitDistance = defaultOrbitDistance
+        focusedItemID = nil
+        isVirtualCameraActive = true
+
+        let targetMatrix = Self.dollhouseCameraTransform(
+            pivot: orbitPivot,
+            yaw: orbitYaw,
+            pitch: orbitPitch,
+            distance: orbitDistance
+        )
+
+        if duration > 0 {
+            animateCamera(
+                from: startMatrix,
+                to: targetMatrix,
+                lookAtStart: startLookAt,
+                lookAtEnd: orbitPivot,
+                duration: duration
+            )
+        } else {
+            animationTask?.cancel()
+            animationTask = nil
+            virtualCameraTransform = Transform(matrix: targetMatrix)
+            currentLookAtTarget = orbitPivot
+        }
+    }
+
+    /// Leaves Dollhouse viewer mode completely and restores Live AR camera control semantics.
+    public func disableDollhouseOrbit() {
+        animationTask?.cancel()
+        animationTask = nil
+        focusedItemID = nil
+        isDollhouseOrbitEnabled = false
+        isVirtualCameraActive = false
+    }
+
+    /// Orbits the Dollhouse virtual camera by horizontal/vertical angular deltas in radians.
+    public func orbitBy(deltaYaw: Float, deltaPitch: Float) {
+        guard isDollhouseOrbitEnabled,
+              deltaYaw.isFinite,
+              deltaPitch.isFinite else {
+            return
+        }
+
+        if focusedItemID != nil {
+            syncOrbitParametersFromCurrentView(pivot: currentLookAtTarget)
+        }
+        animationTask?.cancel()
+        animationTask = nil
+        focusedItemID = nil
+
+        orbitYaw += deltaYaw
+        orbitPitch = min(max(orbitPitch + deltaPitch, Self.minOrbitPitch), Self.maxOrbitPitch)
+        applyOrbitTransform()
+    }
+
+    /// Pans the Dollhouse orbit pivot parallel to the camera's screen right and up axes.
+    public func panBy(deltaRight: Float, deltaUp: Float) {
+        guard isDollhouseOrbitEnabled,
+              deltaRight.isFinite,
+              deltaUp.isFinite else {
+            return
+        }
+
+        if focusedItemID != nil {
+            syncOrbitParametersFromCurrentView(pivot: currentLookAtTarget)
+        }
+        animationTask?.cancel()
+        animationTask = nil
+        focusedItemID = nil
+
+        let matrix = virtualCameraTransform.matrix
+        let right = simd_normalize(simd_float3(matrix.columns.0.x, matrix.columns.0.y, matrix.columns.0.z))
+        let up = simd_normalize(simd_float3(matrix.columns.1.x, matrix.columns.1.y, matrix.columns.1.z))
+        orbitPivot += right * deltaRight + up * deltaUp
+        applyOrbitTransform()
+    }
+
+    /// Zooms the Dollhouse camera inward (> 1.0) or outward (< 1.0) toward the current pivot.
+    public func zoomBy(scaleFactor: Float) {
+        guard isDollhouseOrbitEnabled,
+              scaleFactor.isFinite,
+              scaleFactor > 0.01 else {
+            return
+        }
+
+        if focusedItemID != nil {
+            syncOrbitParametersFromCurrentView(pivot: currentLookAtTarget)
+        }
+        animationTask?.cancel()
+        animationTask = nil
+        focusedItemID = nil
+
+        orbitDistance = min(
+            max(orbitDistance / scaleFactor, Self.minOrbitDistance),
+            Self.maxOrbitDistance
+        )
+        applyOrbitTransform()
+    }
+
+    /// Exits equipment focus mode: in Dollhouse mode returns to orbit overview;
+    /// in Live AR mode restores the live AR spatial tracking camera.
+    public func exitFocusMode() {
+        if isDollhouseOrbitEnabled {
+            resetToDollhouseOrbit(duration: 0.55)
+            return
+        }
+        animationTask?.cancel()
+        animationTask = nil
+        focusedItemID = nil
+        isVirtualCameraActive = false
+    }
+
+    private func syncOrbitParametersFromCurrentView(pivot: simd_float3) {
+        let eye = Self.extractPosition(from: virtualCameraTransform.matrix)
+        let offset = eye - pivot
+        let dist = simd_length(offset)
+        orbitPivot = pivot
+        orbitDistance = min(max(dist, Self.minOrbitDistance), Self.maxOrbitDistance)
+        if dist > 1e-4 {
+            let clampedY = min(max(offset.y / dist, -0.999), 0.999)
+            orbitPitch = min(max(asin(clampedY), Self.minOrbitPitch), Self.maxOrbitPitch)
+            orbitYaw = atan2(offset.x, offset.z)
+        }
+    }
+
+    private func applyOrbitTransform() {
+        let matrix = Self.dollhouseCameraTransform(
+            pivot: orbitPivot,
+            yaw: orbitYaw,
+            pitch: orbitPitch,
+            distance: orbitDistance
+        )
+        isVirtualCameraActive = true
+        virtualCameraTransform = Transform(matrix: matrix)
+        currentLookAtTarget = orbitPivot
+    }
+
+    private func animateCamera(
+        from startTransformMatrix: simd_float4x4,
+        to endTransformMatrix: simd_float4x4,
+        lookAtStart: simd_float3,
+        lookAtEnd: simd_float3,
+        duration: TimeInterval
+    ) {
+        animationTask?.cancel()
         virtualCameraTransform = Transform(matrix: startTransformMatrix)
-        currentLookAtTarget = startLookAt
+        currentLookAtTarget = lookAtStart
 
         guard duration > 0 else {
             virtualCameraTransform = Transform(matrix: endTransformMatrix)
-            currentLookAtTarget = targetLookAt
+            currentLookAtTarget = lookAtEnd
             return
         }
 
@@ -80,8 +283,8 @@ public final class CameraFocusController: ObservableObject {
                 let state = Self.interpolateCameraState(
                     from: startTransformMatrix,
                     to: endTransformMatrix,
-                    lookAtStart: startLookAt,
-                    lookAtEnd: targetLookAt,
+                    lookAtStart: lookAtStart,
+                    lookAtEnd: lookAtEnd,
                     progress: rawProgress
                 )
 
@@ -97,15 +300,25 @@ public final class CameraFocusController: ObservableObject {
         }
     }
 
-    /// Exits equipment focus mode and restores the live AR spatial tracking camera.
-    public func exitFocusMode() {
-        animationTask?.cancel()
-        animationTask = nil
-        focusedItemID = nil
-        isVirtualCameraActive = false
-    }
-
     // MARK: - Pure Spatial & Easing Math
+
+    /// Computes a world-space camera transform orbiting `pivot` at spherical coordinates `(yaw, pitch, distance)`.
+    nonisolated public static func dollhouseCameraTransform(
+        pivot: simd_float3,
+        yaw: Float,
+        pitch: Float,
+        distance: Float
+    ) -> simd_float4x4 {
+        let clampedPitch = min(max(pitch, minOrbitPitch), maxOrbitPitch)
+        let clampedDistance = min(max(distance, minOrbitDistance), maxOrbitDistance)
+        let cosPitch = cos(clampedPitch)
+        let eyeOffset = simd_float3(
+            clampedDistance * cosPitch * sin(yaw),
+            clampedDistance * sin(clampedPitch),
+            clampedDistance * cosPitch * cos(yaw)
+        )
+        return lookAtTransform(eye: pivot + eyeOffset, target: pivot)
+    }
 
     /// Cubic ease-in-out timing curve over `[0, 1]`.
     nonisolated public static func cubicEaseInOut(_ t: Float) -> Float {
