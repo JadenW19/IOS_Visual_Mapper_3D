@@ -50,7 +50,7 @@ public final class EquipmentClusteringManager: ObservableObject {
         "autorefractor", "lens drawer", "optometry chair", "armchair",
         "cabinet", "filing cabinet", "shelf", "refrigerator", "whiteboard",
         "wheelchair", "examination light", "rolling stool", "radiator", "sink",
-        "door", "bed", "bench", "television", "monitor"
+        "door", "bed", "bench", "television"
     ]
 
     nonisolated private static let monitorContextLabels: Set<String> = [
