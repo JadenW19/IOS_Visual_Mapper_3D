@@ -7,7 +7,7 @@ import simd
 @MainActor
 public final class EquipmentClusteringManager: ObservableObject {
     /// Maximum Euclidean distance (in meters) within which matching-label detections merge.
-    public static let defaultMergeRadiusMeters: Float = 0.35
+    nonisolated public static let defaultMergeRadiusMeters: Float = 0.35
 
     @Published public private(set) var trackedEquipment: [TrackedEquipment3D] = []
 
