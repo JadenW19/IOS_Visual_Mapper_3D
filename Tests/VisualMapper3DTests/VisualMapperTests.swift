@@ -655,60 +655,7 @@ final class VisualMapperTests: XCTestCase {
             }
         }
 
-        func makeTriangleSnapshot(
-            positions: [SIMD3<Float>],
-            normals: [SIMD3<Float>],
-            classifications: [ARMeshClassification],
-            translation: SIMD3<Float>
-        ) -> MeshAnchorSnapshot {
-            var vertexData = Data()
-            for p in positions {
-                var x = p.x; var y = p.y; var z = p.z
-                vertexData.append(Data(bytes: &x, count: 4))
-                vertexData.append(Data(bytes: &y, count: 4))
-                vertexData.append(Data(bytes: &z, count: 4))
-            }
-            var normalData = Data()
-            for n in normals {
-                var x = n.x; var y = n.y; var z = n.z
-                normalData.append(Data(bytes: &x, count: 4))
-                normalData.append(Data(bytes: &y, count: 4))
-                normalData.append(Data(bytes: &z, count: 4))
-            }
-            var indexData = Data()
-            for idx in 0..<UInt16(positions.count) {
-                var v = idx
-                indexData.append(Data(bytes: &v, count: 2))
-            }
-            let classData = Data(classifications.map { UInt8($0.rawValue) })
-
-            var transform = matrix_identity_float4x4
-            transform.columns.3 = SIMD4<Float>(translation.x, translation.y, translation.z, 1.0)
-
-            return MeshAnchorSnapshot(
-                id: UUID(),
-                transform: transform,
-                vertexData: vertexData,
-                vertexCount: positions.count,
-                vertexStride: 12,
-                vertexOffset: 0,
-                normalData: normalData,
-                normalCount: normals.count,
-                normalStride: 12,
-                normalOffset: 0,
-                indexData: indexData,
-                faceCount: classifications.count,
-                bytesPerIndex: 2,
-                indexCountPerPrimitive: 3,
-                isTrianglePrimitive: true,
-                classificationData: classData,
-                classificationCount: classifications.count,
-                classificationStride: 1,
-                classificationOffset: 0
-            )
-        }
-
-        let floorWallSnap = makeTriangleSnapshot(
+        let floorWallSnap = Self.makeSyntheticTriangleSnapshot(
             positions: [
                 SIMD3<Float>(0, 0, 0), SIMD3<Float>(2, 0, 0), SIMD3<Float>(0, 0, 2),
                 SIMD3<Float>(0, 0, 0), SIMD3<Float>(0, 2.5, 0), SIMD3<Float>(2, 0, 0)
@@ -721,7 +668,7 @@ final class VisualMapperTests: XCTestCase {
             translation: SIMD3<Float>(1, 0, -1)
         )
 
-        let ceilingSnap = makeTriangleSnapshot(
+        let ceilingSnap = Self.makeSyntheticTriangleSnapshot(
             positions: [SIMD3<Float>(0, 2.8, 0), SIMD3<Float>(2, 2.8, 0), SIMD3<Float>(0, 2.8, 2)],
             normals: [SIMD3<Float>(0, -1, 0), SIMD3<Float>(0, -1, 0), SIMD3<Float>(0, -1, 0)],
             classifications: [.ceiling],
@@ -1015,5 +962,247 @@ final class VisualMapperTests: XCTestCase {
         )
         XCTAssertEqual(retained, Set([nearID, midID]))
         XCTAssertFalse(retained.contains(farID))
+    }
+
+    func testScanCoverageSectorsAndTextureKeyframeSelection() {
+        // Identity transform looks down -Z; a point along -Z must map to the identical sector.
+        let cameraLookNegZ = matrix_identity_float4x4
+        let lookSector = ARSessionManager.sectorIndex(forCameraTransform: cameraLookNegZ)
+        let pointSector = ARSessionManager.sectorIndex(
+            forPoint: simd_float3(0, 0, -2.5),
+            relativeTo: .zero
+        )
+        XCTAssertEqual(lookSector, pointSector)
+
+        // First pose must always request slot 0.
+        XCTAssertEqual(
+            ARSessionManager.shouldCaptureTextureKeyframe(
+                cameraTransform: cameraLookNegZ,
+                existingKeyframes: []
+            ),
+            0
+        )
+
+        let dummyKF = CapturedTextureKeyframe(
+            cameraTransform: cameraLookNegZ,
+            intrinsics: matrix_identity_float3x3,
+            imageResolution: CGSize(width: 512, height: 384),
+            jpegData: Data([0x01]),
+            timestamp: 1.0,
+            sectorIndex: lookSector
+        )
+
+        // Same pose in an already-covered sector must be skipped.
+        XCTAssertNil(
+            ARSessionManager.shouldCaptureTextureKeyframe(
+                cameraTransform: cameraLookNegZ,
+                existingKeyframes: [dummyKF]
+            )
+        )
+
+        // When saturated at maxKeyframes with duplicates in one sector, an unseen sector must win a slot.
+        var saturated = Array(repeating: dummyKF, count: ARSessionManager.maxTextureKeyframes)
+        for i in 0..<saturated.count {
+            saturated[i] = CapturedTextureKeyframe(
+                cameraTransform: cameraLookNegZ,
+                intrinsics: matrix_identity_float3x3,
+                imageResolution: CGSize(width: 512, height: 384),
+                jpegData: Data([0x01]),
+                timestamp: Double(i),
+                sectorIndex: lookSector
+            )
+        }
+        // Rotate camera to look toward +X (sector 0) while -Z is sector 9.
+        var cameraLookPosX = matrix_identity_float4x4
+        cameraLookPosX.columns.0 = SIMD4<Float>(0, 0, 1, 0)
+        cameraLookPosX.columns.2 = SIMD4<Float>(-1, 0, 0, 0)
+
+        let replacementSlot = ARSessionManager.shouldCaptureTextureKeyframe(
+            cameraTransform: cameraLookPosX,
+            existingKeyframes: saturated
+        )
+        XCTAssertNotNil(replacementSlot)
+    }
+
+    func testPhotorealisticUVProjectionAtlasAndFloorHoleFilling() async throws {
+        let baker = RoomModelBaker()
+
+        let renderer = UIGraphicsImageRenderer(size: CGSize(width: 64, height: 48))
+        let testImage = renderer.image { context in
+            UIColor.systemOrange.setFill()
+            context.fill(CGRect(x: 0, y: 0, width: 64, height: 48))
+        }
+        let jpegData = try XCTUnwrap(testImage.jpegData(compressionQuality: 0.85))
+
+        var cameraTransform = matrix_identity_float4x4
+        cameraTransform.columns.3 = SIMD4<Float>(0, 1.2, 0, 1)
+        let intrinsics = simd_float3x3(columns: (
+            SIMD3<Float>(1000, 0, 0),
+            SIMD3<Float>(0, 1000, 0),
+            SIMD3<Float>(960, 720, 1)
+        ))
+        let keyframe = CapturedTextureKeyframe(
+            cameraTransform: cameraTransform,
+            intrinsics: intrinsics,
+            imageResolution: CGSize(width: 1920, height: 1440),
+            jpegData: jpegData,
+            timestamp: 10.0,
+            sectorIndex: ARSessionManager.sectorIndex(forCameraTransform: cameraTransform)
+        )
+
+        // One front-facing wall triangle at z = -2.0 (in view) and one behind-camera at z = +2.0 (palette fallback).
+        let wallSnapshot = Self.makeSyntheticTriangleSnapshot(
+            positions: [
+                SIMD3<Float>(-0.4, 0.9, -2.0), SIMD3<Float>(0.4, 0.9, -2.0), SIMD3<Float>(0.0, 1.5, -2.0),
+                SIMD3<Float>(-0.4, 0.9, 2.0), SIMD3<Float>(0.0, 1.5, 2.0), SIMD3<Float>(0.4, 0.9, 2.0)
+            ],
+            normals: [
+                SIMD3<Float>(0, 0, 1), SIMD3<Float>(0, 0, 1), SIMD3<Float>(0, 0, 1),
+                SIMD3<Float>(0, 0, -1), SIMD3<Float>(0, 0, -1), SIMD3<Float>(0, 0, -1)
+            ],
+            classifications: [.wall, .wall],
+            translation: .zero
+        )
+
+        // Outer border strips around a 2.0m x 2.0m floor square leaving an interior dropout to fill.
+        let floorSnapshot = Self.makeSyntheticTriangleSnapshot(
+            positions: [
+                // Bottom edge strip (z = 0..0.2)
+                SIMD3<Float>(0.0, 0, 0.0), SIMD3<Float>(2.0, 0, 0.0), SIMD3<Float>(1.0, 0, 0.15),
+                // Top edge strip (z = 1.85..2.0)
+                SIMD3<Float>(0.0, 0, 2.0), SIMD3<Float>(1.0, 0, 1.85), SIMD3<Float>(2.0, 0, 2.0),
+                // Left edge strip (x = 0..0.15)
+                SIMD3<Float>(0.0, 0, 0.0), SIMD3<Float>(0.15, 0, 1.0), SIMD3<Float>(0.0, 0, 2.0),
+                // Right edge strip (x = 1.85..2.0)
+                SIMD3<Float>(2.0, 0, 0.0), SIMD3<Float>(2.0, 0, 2.0), SIMD3<Float>(1.85, 0, 1.0)
+            ],
+            normals: Array(repeating: SIMD3<Float>(0, 1, 0), count: 12),
+            classifications: [.floor, .floor, .floor, .floor],
+            translation: .zero
+        )
+
+        let result = try await baker.bakeWithTextures(
+            snapshots: [wallSnapshot, floorSnapshot],
+            keyframes: [keyframe],
+            fillPlanarGaps: true
+        )
+
+        let atlasData = try XCTUnwrap(result.textureAtlasJPEGData)
+        let atlasImage = try XCTUnwrap(UIImage(data: atlasData))
+        XCTAssertEqual(atlasImage.size.width * atlasImage.scale, 2048, accuracy: 1.0)
+        XCTAssertEqual(atlasImage.size.height * atlasImage.scale, 1536, accuracy: 1.0)
+
+        let wallSubmesh = try XCTUnwrap(result.geometry.submeshes.first { $0.category == .wall })
+        XCTAssertEqual(wallSubmesh.texCoords.count, wallSubmesh.positions.count)
+        XCTAssertEqual(wallSubmesh.positions.count, 6)
+
+        // Front-facing triangle UV must land in Tile 0 (col 0: u in 0...0.25, row 0: v in 0.75...1.0).
+        XCTAssertTrue(wallSubmesh.texCoords[0].x >= 0.0 && wallSubmesh.texCoords[0].x <= 0.25)
+        XCTAssertTrue(wallSubmesh.texCoords[0].y >= 0.75 && wallSubmesh.texCoords[0].y <= 1.0)
+
+        // Behind-camera triangle UV must land in Tile 15 semantic palette (col 3: u in 0.75...1.0, row 3: v in 0...0.25).
+        XCTAssertTrue(wallSubmesh.texCoords[3].x >= 0.75 && wallSubmesh.texCoords[3].x <= 1.0)
+        XCTAssertTrue(wallSubmesh.texCoords[3].y >= 0.0 && wallSubmesh.texCoords[3].y <= 0.25)
+
+        // Interior floor dropout must be filled (> 4 original border triangles).
+        let floorSubmesh = try XCTUnwrap(result.geometry.submeshes.first { $0.category == .floor })
+        XCTAssertGreaterThan(floorSubmesh.triangleCount, 4)
+
+        let objText = String(decoding: RoomModelBaker.buildOBJData(from: result.geometry), as: UTF8.self)
+        XCTAssertTrue(objText.contains("vt "))
+    }
+
+    func testScanStoragePersistsAndReloadsTextureAtlas() async throws {
+        let tempDir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("VisualMapperAtlasTests_\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: tempDir) }
+
+        let storage = ScanStorageManager(baseDirectory: tempDir)
+        let submesh = BakedSubmesh(
+            category: .wall,
+            positions: [SIMD3<Float>(0, 0, -1), SIMD3<Float>(1, 0, -1), SIMD3<Float>(0, 1, -1)],
+            normals: [SIMD3<Float>(0, 0, 1), SIMD3<Float>(0, 0, 1), SIMD3<Float>(0, 0, 1)],
+            texCoords: [SIMD2<Float>(0.1, 0.8), SIMD2<Float>(0.2, 0.8), SIMD2<Float>(0.1, 0.9)],
+            indices: [0, 1, 2]
+        )
+        let geometry = BakedRoomGeometry(
+            submeshes: [submesh],
+            boundsMin: SIMD3<Float>(0, 0, -1),
+            boundsMax: SIMD3<Float>(1, 1, -1),
+            vertexCount: 3,
+            triangleCount: 1
+        )
+        let fakeAtlasData = Data([0xFF, 0xD8, 0xFF, 0xE0, 0x12, 0x34])
+
+        let saved = try await storage.saveScan(
+            name: "Photoreal Exam Room",
+            environmentMode: .clinicalLab,
+            geometry: geometry,
+            equipment: [],
+            textureAtlasJPEGData: fakeAtlasData
+        )
+        XCTAssertTrue(saved.hasTextureAtlas)
+
+        let list = try await storage.listSavedScans()
+        XCTAssertEqual(list.first?.hasTextureAtlas, true)
+
+        let loaded = try await storage.loadScan(id: saved.id)
+        XCTAssertEqual(loaded.textureAtlasData, fakeAtlasData)
+        XCTAssertEqual(loaded.geometry.submeshes.first?.texCoords, submesh.texCoords)
+    }
+
+    // MARK: - Helpers
+
+    private static func makeSyntheticTriangleSnapshot(
+        positions: [SIMD3<Float>],
+        normals: [SIMD3<Float>],
+        classifications: [ARMeshClassification],
+        translation: SIMD3<Float>
+    ) -> MeshAnchorSnapshot {
+        var vertexData = Data()
+        for p in positions {
+            var x = p.x; var y = p.y; var z = p.z
+            vertexData.append(Data(bytes: &x, count: 4))
+            vertexData.append(Data(bytes: &y, count: 4))
+            vertexData.append(Data(bytes: &z, count: 4))
+        }
+        var normalData = Data()
+        for n in normals {
+            var x = n.x; var y = n.y; var z = n.z
+            normalData.append(Data(bytes: &x, count: 4))
+            normalData.append(Data(bytes: &y, count: 4))
+            normalData.append(Data(bytes: &z, count: 4))
+        }
+        var indexData = Data()
+        for idx in 0..<UInt16(positions.count) {
+            var v = idx
+            indexData.append(Data(bytes: &v, count: 2))
+        }
+        let classData = Data(classifications.map { UInt8($0.rawValue) })
+
+        var transform = matrix_identity_float4x4
+        transform.columns.3 = SIMD4<Float>(translation.x, translation.y, translation.z, 1.0)
+
+        return MeshAnchorSnapshot(
+            id: UUID(),
+            transform: transform,
+            vertexData: vertexData,
+            vertexCount: positions.count,
+            vertexStride: 12,
+            vertexOffset: 0,
+            normalData: normalData,
+            normalCount: normals.count,
+            normalStride: 12,
+            normalOffset: 0,
+            indexData: indexData,
+            faceCount: classifications.count,
+            bytesPerIndex: 2,
+            indexCountPerPrimitive: 3,
+            isTrianglePrimitive: true,
+            classificationData: classData,
+            classificationCount: classifications.count,
+            classificationStride: 1,
+            classificationOffset: 0
+        )
     }
 }

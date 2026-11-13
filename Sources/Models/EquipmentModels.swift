@@ -178,23 +178,112 @@ public enum RoomSurfaceCategory: String, Codable, Sendable, CaseIterable, Hashab
     }
 }
 
+/// Visual rendering mode in the baked 3D Dollhouse inspector.
+public enum DollhouseRenderMode: String, Codable, Sendable, CaseIterable, Identifiable, Hashable {
+    case photorealistic = "Photoreal"
+    case semanticMesh = "Mesh Build"
+
+    public var id: String { rawValue }
+}
+
+/// Downscaled RGB camera keyframe + exact ARKit pose/intrinsics retained during scanning
+/// for post-scan photorealistic UV texture projection onto the LiDAR room mesh.
+public struct CapturedTextureKeyframe: Sendable, Equatable, Identifiable {
+    public let id: UUID
+    public let cameraTransform: simd_float4x4
+    public let intrinsics: simd_float3x3
+    public let imageResolution: CGSize
+    public let jpegData: Data
+    public let timestamp: TimeInterval
+    public let sectorIndex: Int
+
+    public init(
+        id: UUID = UUID(),
+        cameraTransform: simd_float4x4,
+        intrinsics: simd_float3x3,
+        imageResolution: CGSize,
+        jpegData: Data,
+        timestamp: TimeInterval,
+        sectorIndex: Int
+    ) {
+        self.id = id
+        self.cameraTransform = cameraTransform
+        self.intrinsics = intrinsics
+        self.imageResolution = imageResolution
+        self.jpegData = jpegData
+        self.timestamp = timestamp
+        self.sectorIndex = sectorIndex
+    }
+}
+
+/// Real-time 360-degree scanning coverage metrics tracked across angular sectors around the room.
+public struct ScanCoverageState: Sendable, Equatable {
+    public static let defaultSectorCount: Int = 12
+
+    public let sectorMeshCounts: [Int]
+    public let sectorPhotoCaptured: [Bool]
+    public let activeHeadingSector: Int
+    public let capturedKeyframeCount: Int
+    public let maxKeyframeCount: Int
+    public let overallCoverageFraction: Double
+    public let guidanceHint: String
+
+    public init(
+        sectorMeshCounts: [Int] = Array(repeating: 0, count: ScanCoverageState.defaultSectorCount),
+        sectorPhotoCaptured: [Bool] = Array(repeating: false, count: ScanCoverageState.defaultSectorCount),
+        activeHeadingSector: Int = 0,
+        capturedKeyframeCount: Int = 0,
+        maxKeyframeCount: Int = 15,
+        overallCoverageFraction: Double = 0.0,
+        guidanceHint: String = "Rotate slowly 360° around the room to capture mesh & photos"
+    ) {
+        self.sectorMeshCounts = sectorMeshCounts
+        self.sectorPhotoCaptured = sectorPhotoCaptured
+        self.activeHeadingSector = activeHeadingSector
+        self.capturedKeyframeCount = capturedKeyframeCount
+        self.maxKeyframeCount = maxKeyframeCount
+        self.overallCoverageFraction = overallCoverageFraction
+        self.guidanceHint = guidanceHint
+    }
+}
+
 /// A baked, world-space submesh grouped by architectural surface category.
 public struct BakedSubmesh: Codable, Sendable, Equatable {
     public let category: RoomSurfaceCategory
     public let positions: [SIMD3<Float>]
     public let normals: [SIMD3<Float>]
+    public let texCoords: [SIMD2<Float>]
     public let indices: [UInt32]
+
+    private enum CodingKeys: String, CodingKey {
+        case category
+        case positions
+        case normals
+        case texCoords
+        case indices
+    }
 
     public init(
         category: RoomSurfaceCategory,
         positions: [SIMD3<Float>],
         normals: [SIMD3<Float>],
+        texCoords: [SIMD2<Float>] = [],
         indices: [UInt32]
     ) {
         self.category = category
         self.positions = positions
         self.normals = normals
+        self.texCoords = texCoords
         self.indices = indices
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        category = try container.decode(RoomSurfaceCategory.self, forKey: .category)
+        positions = try container.decode([SIMD3<Float>].self, forKey: .positions)
+        normals = try container.decode([SIMD3<Float>].self, forKey: .normals)
+        texCoords = try container.decodeIfPresent([SIMD2<Float>].self, forKey: .texCoords) ?? []
+        indices = try container.decode([UInt32].self, forKey: .indices)
     }
 
     public var triangleCount: Int {
@@ -244,6 +333,7 @@ public struct SavedRoomScanMetadata: Identifiable, Codable, Sendable, Equatable,
     public let boundsMax: SIMD3<Float>
     public let vertexCount: Int
     public let triangleCount: Int
+    public var hasTextureAtlas: Bool
 
     private enum CodingKeys: String, CodingKey {
         case id
@@ -255,6 +345,7 @@ public struct SavedRoomScanMetadata: Identifiable, Codable, Sendable, Equatable,
         case boundsMax
         case vertexCount
         case triangleCount
+        case hasTextureAtlas
     }
 
     public init(
@@ -266,7 +357,8 @@ public struct SavedRoomScanMetadata: Identifiable, Codable, Sendable, Equatable,
         boundsMin: SIMD3<Float>,
         boundsMax: SIMD3<Float>,
         vertexCount: Int,
-        triangleCount: Int
+        triangleCount: Int,
+        hasTextureAtlas: Bool = false
     ) {
         self.id = id
         self.name = name
@@ -277,6 +369,7 @@ public struct SavedRoomScanMetadata: Identifiable, Codable, Sendable, Equatable,
         self.boundsMax = boundsMax
         self.vertexCount = vertexCount
         self.triangleCount = triangleCount
+        self.hasTextureAtlas = hasTextureAtlas
     }
 
     public init(from decoder: Decoder) throws {
@@ -290,6 +383,7 @@ public struct SavedRoomScanMetadata: Identifiable, Codable, Sendable, Equatable,
         boundsMax = try container.decode(SIMD3<Float>.self, forKey: .boundsMax)
         vertexCount = try container.decode(Int.self, forKey: .vertexCount)
         triangleCount = try container.decode(Int.self, forKey: .triangleCount)
+        hasTextureAtlas = try container.decodeIfPresent(Bool.self, forKey: .hasTextureAtlas) ?? false
     }
 }
 
@@ -344,10 +438,16 @@ public struct BakedRoomScan: Identifiable, Sendable, Equatable {
     public var id: UUID { metadata.id }
     public var metadata: SavedRoomScanMetadata
     public let geometry: BakedRoomGeometry
+    public let textureAtlasData: Data?
 
-    public init(metadata: SavedRoomScanMetadata, geometry: BakedRoomGeometry) {
+    public init(
+        metadata: SavedRoomScanMetadata,
+        geometry: BakedRoomGeometry,
+        textureAtlasData: Data? = nil
+    ) {
         self.metadata = metadata
         self.geometry = geometry
+        self.textureAtlasData = textureAtlasData
     }
 }
 

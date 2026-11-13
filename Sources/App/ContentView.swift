@@ -26,6 +26,7 @@ public struct ContentView: View {
     @State private var stage: MapperStage = .home
     @State private var environmentMode: EnvironmentMode = .clinicalLab
     @State private var meshRenderStyle: MeshRenderStyle = .wireframe
+    @State private var dollhouseRenderMode: DollhouseRenderMode = .photorealistic
     @State private var showCeiling: Bool = false
     @State private var modelLoadErrorMessage: String?
     @State private var scanActionErrorMessage: String?
@@ -103,6 +104,11 @@ public struct ContentView: View {
                         }
 
                         if stage == .scanning {
+                            scanCoverageHUD
+                                .padding(.horizontal, 16)
+                                .padding(.bottom, 8)
+                                .zIndex(10)
+
                             finishScanButton
                                 .padding(.horizontal, 16)
                                 .padding(.bottom, 10)
@@ -185,6 +191,7 @@ public struct ContentView: View {
                 equipment: clusteringManager.trackedEquipment,
                 focusController: focusController,
                 showCeiling: showCeiling,
+                renderMode: dollhouseRenderMode,
                 onSelectEquipment: { item in
                     focusController.focusOnEquipment(item)
                     inspectedEquipment = item
@@ -267,68 +274,177 @@ public struct ContentView: View {
     }
 
     private func topDollhouseBar(scan: BakedRoomScan) -> some View {
-        HStack(spacing: 8) {
-            Button {
-                returnToHome()
-            } label: {
-                Image(systemName: "house.fill")
-                    .font(.body.weight(.semibold))
-                    .padding(8)
-                    .background(.ultraThinMaterial, in: Circle())
-            }
-            .buttonStyle(.plain)
-            .accessibilityLabel("Aunty.cloud Home")
+        VStack(spacing: 8) {
+            HStack(spacing: 8) {
+                Button {
+                    returnToHome()
+                } label: {
+                    Image(systemName: "house.fill")
+                        .font(.body.weight(.semibold))
+                        .padding(8)
+                        .background(.ultraThinMaterial, in: Circle())
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel("Aunty.cloud Home")
 
-            VStack(alignment: .leading, spacing: 2) {
-                Text(scan.metadata.name)
-                    .font(.caption.weight(.bold))
-                    .lineLimit(1)
-                Text("Dollhouse 3D • \(scan.geometry.triangleCount.formatted()) tris")
-                    .font(.caption2)
-                    .foregroundStyle(.secondary)
-                    .lineLimit(1)
-            }
-            .padding(.horizontal, 12)
-            .padding(.vertical, 6)
-            .background(.ultraThinMaterial, in: Capsule())
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(scan.metadata.name)
+                        .font(.caption.weight(.bold))
+                        .lineLimit(1)
+                    Text("Dollhouse 3D • \(scan.geometry.triangleCount.formatted()) tris")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                }
+                .padding(.horizontal, 12)
+                .padding(.vertical, 6)
+                .background(.ultraThinMaterial, in: Capsule())
 
-            Spacer(minLength: 4)
+                Spacer(minLength: 4)
 
-            Button {
-                showCeiling.toggle()
-            } label: {
-                Label("Ceiling", systemImage: showCeiling ? "eye.fill" : "eye.slash")
-                    .font(.caption.weight(.semibold))
-                    .padding(.horizontal, 10)
-                    .padding(.vertical, 7)
-                    .background(.ultraThinMaterial, in: Capsule())
-            }
-            .buttonStyle(.plain)
+                Button {
+                    presentSavedScans()
+                } label: {
+                    Image(systemName: "folder.fill")
+                        .font(.body.weight(.semibold))
+                        .padding(8)
+                        .background(.ultraThinMaterial, in: Circle())
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel("Saved scans")
 
-            Button {
-                presentSavedScans()
-            } label: {
-                Image(systemName: "folder.fill")
-                    .font(.body.weight(.semibold))
-                    .padding(8)
-                    .background(.ultraThinMaterial, in: Circle())
+                Button {
+                    startNewEnvironmentScan()
+                } label: {
+                    Label("Rescan", systemImage: "camera.viewfinder")
+                        .font(.caption.weight(.semibold))
+                        .padding(.horizontal, 10)
+                        .padding(.vertical, 7)
+                        .background(Color.accentColor.opacity(0.85), in: Capsule())
+                }
+                .buttonStyle(.plain)
             }
-            .buttonStyle(.plain)
-            .accessibilityLabel("Saved scans")
 
-            Button {
-                startNewEnvironmentScan()
-            } label: {
-                Label("Rescan", systemImage: "camera.viewfinder")
-                    .font(.caption.weight(.semibold))
-                    .padding(.horizontal, 10)
-                    .padding(.vertical, 7)
-                    .background(Color.accentColor.opacity(0.85), in: Capsule())
+            HStack(spacing: 8) {
+                if scan.textureAtlasData != nil {
+                    Picker("Render Mode", selection: $dollhouseRenderMode) {
+                        ForEach(DollhouseRenderMode.allCases) { mode in
+                            Text(mode.rawValue).tag(mode)
+                        }
+                    }
+                    .pickerStyle(.segmented)
+                    .frame(maxWidth: 205)
+                } else {
+                    Label("Mesh Build Mode", systemImage: "cube.transparent")
+                        .font(.caption2.weight(.semibold))
+                        .foregroundStyle(.secondary)
+                        .padding(.horizontal, 10)
+                        .padding(.vertical, 6)
+                        .background(.ultraThinMaterial, in: Capsule())
+                }
+
+                Spacer(minLength: 4)
+
+                Button {
+                    showCeiling.toggle()
+                } label: {
+                    Label("Ceiling", systemImage: showCeiling ? "eye.fill" : "eye.slash")
+                        .font(.caption.weight(.semibold))
+                        .padding(.horizontal, 10)
+                        .padding(.vertical, 7)
+                        .background(.ultraThinMaterial, in: Capsule())
+                }
+                .buttonStyle(.plain)
             }
-            .buttonStyle(.plain)
         }
         .padding(.horizontal, 14)
         .padding(.top, 8)
+    }
+
+    private var scanCoverageHUD: some View {
+        let coverage = sessionManager.scanCoverage
+        let sectorCount = max(1, coverage.sectorMeshCounts.count)
+        let pct = Int((coverage.overallCoverageFraction * 100.0).rounded())
+
+        return HStack(spacing: 12) {
+            ZStack {
+                Canvas { context, size in
+                    let center = CGPoint(x: size.width * 0.5, y: size.height * 0.5)
+                    let radius = min(size.width, size.height) * 0.42
+                    let stepAngle = (2.0 * Double.pi) / Double(sectorCount)
+                    let gap = 0.09
+
+                    for idx in 0..<sectorCount {
+                        let start = -Double.pi * 0.5 + Double(idx) * stepAngle + gap
+                        let end = -Double.pi * 0.5 + Double(idx + 1) * stepAngle - gap
+
+                        var path = Path()
+                        path.addArc(
+                            center: center,
+                            radius: radius,
+                            startAngle: .radians(start),
+                            endAngle: .radians(end),
+                            clockwise: false
+                        )
+
+                        let hasMesh = idx < coverage.sectorMeshCounts.count && coverage.sectorMeshCounts[idx] > 0
+                        let hasPhoto = idx < coverage.sectorPhotoCaptured.count && coverage.sectorPhotoCaptured[idx]
+                        let isActive = (idx == coverage.activeHeadingSector)
+
+                        let color: Color
+                        if hasMesh && hasPhoto {
+                            color = .green
+                        } else if hasMesh {
+                            color = .cyan
+                        } else if isActive {
+                            color = .orange
+                        } else {
+                            color = .white.opacity(0.22)
+                        }
+
+                        context.stroke(
+                            path,
+                            with: .color(color),
+                            style: StrokeStyle(
+                                lineWidth: isActive ? 5.5 : 3.5,
+                                lineCap: .round
+                            )
+                        )
+                    }
+                }
+                .frame(width: 44, height: 44)
+
+                Text("\(pct)%")
+                    .font(.system(size: 10, weight: .bold, design: .rounded))
+                    .foregroundStyle(.white)
+            }
+
+            VStack(alignment: .leading, spacing: 3) {
+                HStack(spacing: 6) {
+                    Text("360° Scan Guide")
+                        .font(.caption.weight(.bold))
+                        .foregroundStyle(.white)
+
+                    Text("\(coverage.capturedKeyframeCount)/\(coverage.maxKeyframeCount) Photos")
+                        .font(.caption2.weight(.semibold))
+                        .padding(.horizontal, 7)
+                        .padding(.vertical, 2)
+                        .background(.cyan.opacity(0.22), in: Capsule())
+                        .foregroundStyle(.cyan)
+                }
+
+                Text(coverage.guidanceHint)
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(2)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+
+            Spacer(minLength: 0)
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 9)
+        .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 14, style: .continuous))
     }
 
     private var finishScanButton: some View {
@@ -522,6 +638,7 @@ public struct ContentView: View {
         focusController.exitFocusMode()
 
         let snapshots = sessionManager.extractMeshSnapshots()
+        let keyframes = sessionManager.extractTextureKeyframes()
         let activeMode = environmentMode
 
         stage = .baking(progress: 0.05, status: "Consolidating 3D observations (NMS)…")
@@ -530,7 +647,11 @@ public struct ContentView: View {
         bakingTask?.cancel()
         bakingTask = Task {
             do {
-                let geometry = try await modelBaker.bake(snapshots: snapshots) { fraction, status in
+                let bakeResult = try await modelBaker.bakeWithTextures(
+                    snapshots: snapshots,
+                    keyframes: keyframes,
+                    fillPlanarGaps: true
+                ) { fraction, status in
                     Task { @MainActor in
                         if case .baking = self.stage {
                             self.stage = .baking(progress: fraction, status: status)
@@ -550,10 +671,15 @@ public struct ContentView: View {
                 let metadata = try await storageManager.saveScan(
                     name: defaultName,
                     environmentMode: activeMode,
-                    geometry: geometry,
-                    equipment: consolidatedEquipment
+                    geometry: bakeResult.geometry,
+                    equipment: consolidatedEquipment,
+                    textureAtlasJPEGData: bakeResult.textureAtlasJPEGData
                 )
-                let bakedScan = BakedRoomScan(metadata: metadata, geometry: geometry)
+                let bakedScan = BakedRoomScan(
+                    metadata: metadata,
+                    geometry: bakeResult.geometry,
+                    textureAtlasData: bakeResult.textureAtlasJPEGData
+                )
 
                 await refreshSavedScans()
                 await MainActor.run {
@@ -578,6 +704,7 @@ public struct ContentView: View {
         clusteringManager.loadEquipment(scan.metadata.equipment)
         inspectedEquipment = nil
         showCeiling = false
+        dollhouseRenderMode = (scan.textureAtlasData != nil) ? .photorealistic : .semanticMesh
         scanActionErrorMessage = nil
         focusController.configureDollhouseOrbit(
             boundsMin: scan.geometry.boundsMin,

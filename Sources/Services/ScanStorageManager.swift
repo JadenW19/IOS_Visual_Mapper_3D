@@ -16,7 +16,7 @@ public actor ScanStorageManager {
         }
     }
 
-    /// Saves a baked room scan and its equipment roster to disk, including a `.obj` export.
+    /// Saves a baked room scan and its equipment roster to disk, including `.obj` and optional photorealistic texture atlas.
     @discardableResult
     public func saveScan(
         id: UUID = UUID(),
@@ -24,7 +24,8 @@ public actor ScanStorageManager {
         createdAt: Date = Date(),
         environmentMode: EnvironmentMode = .clinicalLab,
         geometry: BakedRoomGeometry,
-        equipment: [TrackedEquipment3D]
+        equipment: [TrackedEquipment3D],
+        textureAtlasJPEGData: Data? = nil
     ) throws -> SavedRoomScanMetadata {
         let trimmedName = name.trimmingCharacters(in: .whitespacesAndNewlines)
         let resolvedName = trimmedName.isEmpty
@@ -40,7 +41,8 @@ public actor ScanStorageManager {
             boundsMin: geometry.boundsMin,
             boundsMax: geometry.boundsMax,
             vertexCount: geometry.vertexCount,
-            triangleCount: geometry.triangleCount
+            triangleCount: geometry.triangleCount,
+            hasTextureAtlas: textureAtlasJPEGData != nil
         )
 
         let fileManager = FileManager()
@@ -65,6 +67,13 @@ public actor ScanStorageManager {
 
             let objData = RoomModelBaker.buildOBJData(from: geometry)
             try objData.write(to: objURL(in: scanDirectory), options: .atomic)
+
+            let atlasFile = textureAtlasURL(in: scanDirectory)
+            if let textureAtlasJPEGData, !textureAtlasJPEGData.isEmpty {
+                try textureAtlasJPEGData.write(to: atlasFile, options: .atomic)
+            } else if fileManager.fileExists(atPath: atlasFile.path) {
+                try? fileManager.removeItem(at: atlasFile)
+            }
 
             return metadata
         } catch let error as VisualMapperError {
@@ -132,7 +141,16 @@ public actor ScanStorageManager {
             let plistDecoder = PropertyListDecoder()
             let geometry = try plistDecoder.decode(BakedRoomGeometry.self, from: geomData)
 
-            return BakedRoomScan(metadata: metadata, geometry: geometry)
+            let atlasFile = textureAtlasURL(in: scanDirectory)
+            let textureAtlasData = fileManager.fileExists(atPath: atlasFile.path)
+                ? try? Data(contentsOf: atlasFile)
+                : nil
+
+            return BakedRoomScan(
+                metadata: metadata,
+                geometry: geometry,
+                textureAtlasData: textureAtlasData
+            )
         } catch let error as VisualMapperError {
             throw error
         } catch {
@@ -162,6 +180,13 @@ public actor ScanStorageManager {
         return fileManager.fileExists(atPath: url.path) ? url : nil
     }
 
+    /// Returns the URL of the baked texture atlas JPEG for a saved scan if it exists.
+    public func exportedTextureAtlasURL(for id: UUID) -> URL? {
+        let fileManager = FileManager()
+        let url = textureAtlasURL(in: directoryURL(for: id))
+        return fileManager.fileExists(atPath: url.path) ? url : nil
+    }
+
     // MARK: - Path Helpers
 
     private func directoryURL(for id: UUID) -> URL {
@@ -178,5 +203,9 @@ public actor ScanStorageManager {
 
     private func objURL(in directory: URL) -> URL {
         directory.appendingPathComponent("model.obj", isDirectory: false)
+    }
+
+    private func textureAtlasURL(in directory: URL) -> URL {
+        directory.appendingPathComponent("texture_atlas.jpg", isDirectory: false)
     }
 }

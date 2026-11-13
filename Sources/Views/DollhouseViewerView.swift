@@ -12,6 +12,7 @@ public struct DollhouseViewerView: View {
     public let equipment: [TrackedEquipment3D]
     @ObservedObject var focusController: CameraFocusController
     public let showCeiling: Bool
+    public let renderMode: DollhouseRenderMode
     public let onSelectEquipment: (TrackedEquipment3D) -> Void
 
     @StateObject private var sceneCoordinator = DollhouseSceneCoordinator()
@@ -21,12 +22,14 @@ public struct DollhouseViewerView: View {
         equipment: [TrackedEquipment3D],
         focusController: CameraFocusController,
         showCeiling: Bool = false,
+        renderMode: DollhouseRenderMode = .photorealistic,
         onSelectEquipment: @escaping (TrackedEquipment3D) -> Void
     ) {
         self.scan = scan
         self.equipment = equipment
         self.focusController = focusController
         self.showCeiling = showCeiling
+        self.renderMode = renderMode
         self.onSelectEquipment = onSelectEquipment
     }
 
@@ -48,7 +51,8 @@ public struct DollhouseViewerView: View {
                     focusController: focusController,
                     scan: scan,
                     equipment: equipment,
-                    showCeiling: showCeiling
+                    showCeiling: showCeiling,
+                    renderMode: renderMode
                 )
             } else {
                 DollhouseLegacyARView(
@@ -56,7 +60,8 @@ public struct DollhouseViewerView: View {
                     focusController: focusController,
                     scan: scan,
                     equipment: equipment,
-                    showCeiling: showCeiling
+                    showCeiling: showCeiling,
+                    renderMode: renderMode
                 )
             }
 
@@ -78,12 +83,13 @@ private struct DollhouseRealityView: View {
     let scan: BakedRoomScan
     let equipment: [TrackedEquipment3D]
     let showCeiling: Bool
+    let renderMode: DollhouseRenderMode
 
     var body: some View {
         RealityView { content in
             content.camera = .virtual
             sceneCoordinator.configureLightingIfNeeded()
-            sceneCoordinator.syncScanGeometry(scan, showCeiling: showCeiling)
+            sceneCoordinator.syncScanGeometry(scan, showCeiling: showCeiling, renderMode: renderMode)
             sceneCoordinator.syncEquipmentMarkers(
                 items: equipment,
                 focusedID: focusController.focusedItemID,
@@ -95,7 +101,7 @@ private struct DollhouseRealityView: View {
                 content.add(sceneCoordinator.rootEntity)
             }
         } update: { _ in
-            sceneCoordinator.syncScanGeometry(scan, showCeiling: showCeiling)
+            sceneCoordinator.syncScanGeometry(scan, showCeiling: showCeiling, renderMode: renderMode)
             sceneCoordinator.syncEquipmentMarkers(
                 items: equipment,
                 focusedID: focusController.focusedItemID,
@@ -114,6 +120,7 @@ private struct DollhouseLegacyARView: UIViewRepresentable {
     let scan: BakedRoomScan
     let equipment: [TrackedEquipment3D]
     let showCeiling: Bool
+    let renderMode: DollhouseRenderMode
 
     func makeCoordinator() -> FrameObserver {
         FrameObserver()
@@ -130,7 +137,7 @@ private struct DollhouseLegacyARView: UIViewRepresentable {
         sceneCoordinator.configureLightingIfNeeded()
         rootAnchor.addChild(sceneCoordinator.rootEntity)
 
-        sceneCoordinator.syncScanGeometry(scan, showCeiling: showCeiling)
+        sceneCoordinator.syncScanGeometry(scan, showCeiling: showCeiling, renderMode: renderMode)
         sceneCoordinator.syncEquipmentMarkers(
             items: equipment,
             focusedID: focusController.focusedItemID,
@@ -147,7 +154,7 @@ private struct DollhouseLegacyARView: UIViewRepresentable {
     }
 
     func updateUIView(_ uiView: ARView, context: Context) {
-        sceneCoordinator.syncScanGeometry(scan, showCeiling: showCeiling)
+        sceneCoordinator.syncScanGeometry(scan, showCeiling: showCeiling, renderMode: renderMode)
         sceneCoordinator.syncEquipmentMarkers(
             items: equipment,
             focusedID: focusController.focusedItemID,
@@ -188,7 +195,10 @@ final class DollhouseSceneCoordinator: ObservableObject {
     private let virtualCamera = PerspectiveCamera()
 
     private var loadedScanID: UUID?
+    private var currentRenderMode: DollhouseRenderMode?
+    private var atlasTexture: TextureResource?
     private var submeshEntitiesByCategory: [RoomSurfaceCategory: ModelEntity] = [:]
+    private var creaseEntitiesByCategory: [RoomSurfaceCategory: ModelEntity] = [:]
     private var markerEntitiesByID: [UUID: Entity] = [:]
     private var markerNodesByID: [UUID: EquipmentMarkerNode] = [:]
     private var hasConfiguredLighting = false
@@ -232,13 +242,31 @@ final class DollhouseSceneCoordinator: ObservableObject {
         virtualCamera.transform = transform
     }
 
-    func syncScanGeometry(_ scan: BakedRoomScan, showCeiling: Bool) {
+    func syncScanGeometry(
+        _ scan: BakedRoomScan,
+        showCeiling: Bool,
+        renderMode: DollhouseRenderMode
+    ) {
         if loadedScanID != scan.id {
             loadedScanID = scan.id
+            currentRenderMode = nil
             for entity in submeshEntitiesByCategory.values {
                 entity.removeFromParent()
             }
             submeshEntitiesByCategory.removeAll()
+            creaseEntitiesByCategory.removeAll()
+
+            if let atlasData = scan.textureAtlasData,
+               let uiImage = UIImage(data: atlasData),
+               let cgImage = uiImage.cgImage {
+                atlasTexture = try? TextureResource.generate(
+                    from: cgImage,
+                    withName: nil,
+                    options: .init(semantic: .color)
+                )
+            } else {
+                atlasTexture = nil
+            }
 
             for submesh in scan.geometry.submeshes {
                 guard let mesh = Self.buildMeshResource(from: submesh) else { continue }
@@ -260,7 +288,34 @@ final class DollhouseSceneCoordinator: ObservableObject {
                     creaseMaterial.triangleFillMode = .lines
                     let creaseEntity = ModelEntity(mesh: mesh, materials: [creaseMaterial])
                     entity.addChild(creaseEntity)
+                    creaseEntitiesByCategory[submesh.category] = creaseEntity
                 }
+            }
+        }
+
+        let effectiveMode: DollhouseRenderMode = (renderMode == .photorealistic && atlasTexture != nil)
+            ? .photorealistic
+            : .semanticMesh
+
+        if currentRenderMode != effectiveMode {
+            currentRenderMode = effectiveMode
+            for (category, entity) in submeshEntitiesByCategory {
+                let resolvedMaterial: any RealityKit.Material
+                if effectiveMode == .photorealistic, let texture = atlasTexture {
+                    var texturedMat = UnlitMaterial(color: .white, applyPostProcessToneMap: false)
+                    texturedMat.color = .init(tint: .white, texture: .init(texture))
+                    if category == .window || category == .opening {
+                        texturedMat.blending = .transparent(opacity: .init(floatLiteral: 0.78))
+                    }
+                    resolvedMaterial = texturedMat
+                } else {
+                    resolvedMaterial = Self.material(for: category)
+                }
+                entity.model?.materials = [resolvedMaterial]
+            }
+
+            for creaseEntity in creaseEntitiesByCategory.values {
+                creaseEntity.isEnabled = (effectiveMode == .semanticMesh)
             }
         }
 
@@ -330,6 +385,9 @@ final class DollhouseSceneCoordinator: ObservableObject {
         var descriptor = MeshDescriptor(name: "Dollhouse_\(submesh.category.rawValue)")
         descriptor.positions = MeshBuffers.Positions(submesh.positions)
         descriptor.normals = MeshBuffers.Normals(submesh.normals)
+        if submesh.texCoords.count == submesh.positions.count {
+            descriptor.textureCoordinates = MeshBuffers.TextureCoordinates(submesh.texCoords)
+        }
         descriptor.primitives = .triangles(submesh.indices)
         return try? MeshResource.generate(from: [descriptor])
     }

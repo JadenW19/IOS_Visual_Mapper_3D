@@ -1,6 +1,7 @@
 import ARKit
 import AVFoundation
 import Combine
+import CoreImage
 import CoreVideo
 import Foundation
 import ImageIO
@@ -99,6 +100,7 @@ public final class ARSessionManager: NSObject, ObservableObject {
         let intrinsics: simd_float3x3
         let imageResolution: CGSize
         let imageOrientation: CGImagePropertyOrientation
+        let timestamp: TimeInterval
     }
 
     @Published public private(set) var sessionState: ARSessionState = .idle
@@ -106,6 +108,7 @@ public final class ARSessionManager: NSObject, ObservableObject {
     @Published public private(set) var currentCameraPosition: simd_float3 = .zero
     @Published public private(set) var trackingStatusMessage: String = "Ready to scan"
     @Published public private(set) var trackedMeshAnchorCount: Int = 0
+    @Published public private(set) var scanCoverage: ScanCoverageState = ScanCoverageState()
     @Published public private(set) var isInferenceInFlight: Bool = false
     @Published public private(set) var sessionRunGeneration: UInt64 = 0
 
@@ -113,12 +116,15 @@ public final class ARSessionManager: NSObject, ObservableObject {
     public static let maxRetainedMeshAnchors: Int = 180
     /// Anchor cap applied immediately when iOS dispatches a low-memory warning.
     public static let memoryWarningMeshAnchorCap: Int = 80
+    /// Maximum number of downscaled RGB keyframes kept for post-scan photorealistic atlas baking.
+    public static let maxTextureKeyframes: Int = 15
 
     public let session: ARSession
     private var throttlePolicy: KeyframeThrottlePolicy
     private var lastPublishedPosition: simd_float3 = .zero
 
     private var meshAnchorsByID: [UUID: ARMeshAnchor] = [:]
+    private var textureKeyframes: [CapturedTextureKeyframe] = []
     private var memoryWarningCancellable: AnyCancellable?
 
     private var detector: (any EquipmentDetecting)?
@@ -298,6 +304,162 @@ public final class ARSessionManager: NSObject, ObservableObject {
         }
     }
 
+    /// Returns all captured texture keyframes ordered chronologically for atlas baking.
+    public func extractTextureKeyframes() -> [CapturedTextureKeyframe] {
+        textureKeyframes.sorted { $0.timestamp < $1.timestamp }
+    }
+
+    /// Registers a captured RGB keyframe at `slotIndex` (or appends up to `maxTextureKeyframes`)
+    /// and refreshes the 360-degree scan coverage HUD state.
+    public func registerTextureKeyframe(_ keyframe: CapturedTextureKeyframe, slotIndex: Int? = nil) {
+        if let slotIndex, slotIndex >= 0, slotIndex < textureKeyframes.count {
+            textureKeyframes[slotIndex] = keyframe
+        } else if textureKeyframes.count < Self.maxTextureKeyframes {
+            textureKeyframes.append(keyframe)
+        }
+        refreshScanCoverage(cameraTransform: currentCameraTransform)
+    }
+
+    /// Computes the horizontal angular sector index `[0, sectorCount)` from a camera transform's forward look vector.
+    nonisolated public static func sectorIndex(
+        forCameraTransform transform: simd_float4x4,
+        sectorCount: Int = ScanCoverageState.defaultSectorCount
+    ) -> Int {
+        guard sectorCount > 0 else { return 0 }
+        var fx = -transform.columns.2.x
+        var fz = -transform.columns.2.z
+        if fx * fx + fz * fz < 1e-4 {
+            fx = -transform.columns.1.x
+            fz = -transform.columns.1.z
+        }
+        guard fx.isFinite, fz.isFinite, (fx * fx + fz * fz) > 1e-6 else {
+            return 0
+        }
+        var angle = atan2(fz, fx)
+        if angle < 0 {
+            angle += 2.0 * .pi
+        }
+        let sector = Int((angle / (2.0 * .pi)) * Float(sectorCount))
+        return min(max(sector, 0), sectorCount - 1)
+    }
+
+    /// Computes the horizontal angular sector index `[0, sectorCount)` of `point` relative to `origin`.
+    nonisolated public static func sectorIndex(
+        forPoint point: simd_float3,
+        relativeTo origin: simd_float3,
+        sectorCount: Int = ScanCoverageState.defaultSectorCount
+    ) -> Int {
+        guard sectorCount > 0 else { return 0 }
+        let dx = point.x - origin.x
+        let dz = point.z - origin.z
+        guard dx.isFinite, dz.isFinite, (dx * dx + dz * dz) > 1e-6 else {
+            return 0
+        }
+        var angle = atan2(dz, dx)
+        if angle < 0 {
+            angle += 2.0 * .pi
+        }
+        let sector = Int((angle / (2.0 * .pi)) * Float(sectorCount))
+        return min(max(sector, 0), sectorCount - 1)
+    }
+
+    /// Evaluates whether the current camera pose adds useful angular/spatial coverage for photorealistic
+    /// texture baking, returning the destination slot index in `textureKeyframes` (or `nil` to skip).
+    nonisolated public static func shouldCaptureTextureKeyframe(
+        cameraTransform: simd_float4x4,
+        existingKeyframes: [CapturedTextureKeyframe],
+        maxKeyframes: Int = ARSessionManager.maxTextureKeyframes,
+        minTranslation: Float = 0.35,
+        minRotationDegrees: Float = 22.0
+    ) -> Int? {
+        guard maxKeyframes > 0 else { return nil }
+        let camPos = simd_float3(
+            cameraTransform.columns.3.x,
+            cameraTransform.columns.3.y,
+            cameraTransform.columns.3.z
+        )
+        let rawForward = simd_float3(
+            -cameraTransform.columns.2.x,
+            -cameraTransform.columns.2.y,
+            -cameraTransform.columns.2.z
+        )
+        let forwardLen = simd_length(rawForward)
+        guard camPos.x.isFinite, camPos.y.isFinite, camPos.z.isFinite,
+              forwardLen.isFinite, forwardLen > 1e-4 else {
+            return nil
+        }
+        let camForward = rawForward / forwardLen
+        let targetSector = sectorIndex(forCameraTransform: cameraTransform)
+        let sectorHasPhoto = existingKeyframes.contains { $0.sectorIndex == targetSector }
+        let minCosAngle = cos(minRotationDegrees * .pi / 180.0)
+
+        let isTooCloseToExisting = existingKeyframes.contains { kf in
+            let kfPos = simd_float3(
+                kf.cameraTransform.columns.3.x,
+                kf.cameraTransform.columns.3.y,
+                kf.cameraTransform.columns.3.z
+            )
+            let kfForward = simd_normalize(simd_float3(
+                -kf.cameraTransform.columns.2.x,
+                -kf.cameraTransform.columns.2.y,
+                -kf.cameraTransform.columns.2.z
+            ))
+            let dist = simd_distance(camPos, kfPos)
+            let alignment = simd_dot(camForward, kfForward)
+            return dist < minTranslation && alignment > minCosAngle
+        }
+
+        if existingKeyframes.count < maxKeyframes {
+            if !sectorHasPhoto || !isTooCloseToExisting {
+                return existingKeyframes.count
+            }
+            return nil
+        }
+
+        guard !sectorHasPhoto else { return nil }
+
+        // Replace an extra keyframe from whichever sector currently holds the most duplicates.
+        var indicesBySector: [Int: [Int]] = [:]
+        for (idx, kf) in existingKeyframes.enumerated() {
+            indicesBySector[kf.sectorIndex, default: []].append(idx)
+        }
+        if let redundantEntry = indicesBySector.max(by: { $0.value.count < $1.value.count }),
+           redundantEntry.value.count > 1,
+           let replaceSlot = redundantEntry.value.last {
+            return replaceSlot
+        }
+        return nil
+    }
+
+    /// Downscales a live camera `CVPixelBuffer` to a compact RGB JPEG buffer (`512×384` default)
+    /// inside an `autoreleasepool` so texture capture adds < 1 MB total memory overhead.
+    nonisolated public static func downsampleToJPEGData(
+        pixelBuffer: CVPixelBuffer,
+        targetSize: CGSize = CGSize(width: 512, height: 384),
+        compressionQuality: CGFloat = 0.80
+    ) -> Data? {
+        guard targetSize.width > 0, targetSize.height > 0 else { return nil }
+        return autoreleasepool {
+            let ciImage = CIImage(cvPixelBuffer: pixelBuffer)
+            let srcWidth = ciImage.extent.width
+            let srcHeight = ciImage.extent.height
+            guard srcWidth > 0, srcHeight > 0 else { return nil }
+
+            let scaleX = targetSize.width / srcWidth
+            let scaleY = targetSize.height / srcHeight
+            let scaledImage = ciImage
+                .transformed(by: CGAffineTransform(translationX: -ciImage.extent.minX, y: -ciImage.extent.minY))
+                .transformed(by: CGAffineTransform(scaleX: scaleX, y: scaleY))
+
+            let context = CIContext(options: [.useSoftwareRenderer: false])
+            let renderRect = CGRect(origin: .zero, size: targetSize)
+            guard let cgImage = context.createCGImage(scaledImage, from: renderRect) else {
+                return nil
+            }
+            return UIImage(cgImage: cgImage).jpegData(compressionQuality: compressionQuality)
+        }
+    }
+
     /// Captures thread-safe `Sendable` vertex, normal, face, and classification snapshots
     /// synchronously on the main actor inside `autoreleasepool` so baking can run off-main-thread
     /// with minimal peak transient allocations.
@@ -363,6 +525,8 @@ public final class ARSessionManager: NSObject, ObservableObject {
 
     private func clearMeshState() {
         meshAnchorsByID.removeAll()
+        textureKeyframes.removeAll()
+        scanCoverage = ScanCoverageState()
         syncMeshAnchorCount()
     }
 
@@ -370,6 +534,69 @@ public final class ARSessionManager: NSObject, ObservableObject {
         let count = meshAnchorsByID.count
         if trackedMeshAnchorCount != count {
             trackedMeshAnchorCount = count
+        }
+        refreshScanCoverage(cameraTransform: currentCameraTransform)
+    }
+
+    private func refreshScanCoverage(cameraTransform: simd_float4x4) {
+        let sectorCount = ScanCoverageState.defaultSectorCount
+        var meshCounts = Array(repeating: 0, count: sectorCount)
+        let origin = simd_float3(
+            cameraTransform.columns.3.x,
+            cameraTransform.columns.3.y,
+            cameraTransform.columns.3.z
+        )
+
+        for anchor in meshAnchorsByID.values {
+            let anchorPos = simd_float3(
+                anchor.transform.columns.3.x,
+                anchor.transform.columns.3.y,
+                anchor.transform.columns.3.z
+            )
+            let sector = Self.sectorIndex(
+                forPoint: anchorPos,
+                relativeTo: origin,
+                sectorCount: sectorCount
+            )
+            meshCounts[sector] += 1
+        }
+
+        var photoCaptured = Array(repeating: false, count: sectorCount)
+        for keyframe in textureKeyframes where keyframe.sectorIndex >= 0 && keyframe.sectorIndex < sectorCount {
+            photoCaptured[keyframe.sectorIndex] = true
+        }
+
+        let activeSector = Self.sectorIndex(forCameraTransform: cameraTransform, sectorCount: sectorCount)
+        let meshCoveredSectors = meshCounts.filter { $0 > 0 }.count
+        let photoCoveredSectors = photoCaptured.filter { $0 }.count
+        let fraction = Double(meshCoveredSectors + photoCoveredSectors) / Double(sectorCount * 2)
+
+        let hint: String
+        if meshAnchorsByID.isEmpty {
+            hint = "Point iPhone at walls and floor to initialize LiDAR mesh"
+        } else if photoCoveredSectors < sectorCount {
+            let missingCount = sectorCount - photoCoveredSectors
+            if !photoCaptured[activeSector] {
+                hint = "Hold steady briefly to capture photo for this wall (\(missingCount) sectors left)"
+            } else {
+                hint = "Rotate slowly toward unscanned amber/gray wedges (\(Int((fraction * 100).rounded()))% covered)"
+            }
+        } else {
+            hint = "360° mesh & camera coverage complete — tap Finish & Process Scan"
+        }
+
+        let updated = ScanCoverageState(
+            sectorMeshCounts: meshCounts,
+            sectorPhotoCaptured: photoCaptured,
+            activeHeadingSector: activeSector,
+            capturedKeyframeCount: textureKeyframes.count,
+            maxKeyframeCount: Self.maxTextureKeyframes,
+            overallCoverageFraction: min(max(fraction, 0.0), 1.0),
+            guidanceHint: hint
+        )
+
+        if scanCoverage != updated {
+            scanCoverage = updated
         }
     }
 
@@ -388,6 +615,11 @@ public final class ARSessionManager: NSObject, ObservableObject {
             if simd_distance(cameraPos, lastPublishedPosition) >= 0.04 {
                 lastPublishedPosition = cameraPos
                 currentCameraPosition = cameraPos
+            }
+
+            let activeHeading = Self.sectorIndex(forCameraTransform: transform)
+            if activeHeading != scanCoverage.activeHeadingSector {
+                refreshScanCoverage(cameraTransform: transform)
             }
 
             guard !isProcessingFrame else {
@@ -416,7 +648,12 @@ public final class ARSessionManager: NSObject, ObservableObject {
                 cameraTransform: transform,
                 intrinsics: frame.camera.intrinsics,
                 imageResolution: frame.camera.imageResolution,
-                imageOrientation: imageOrientation
+                imageOrientation: imageOrientation,
+                timestamp: frame.timestamp
+            )
+            let textureSlot = Self.shouldCaptureTextureKeyframe(
+                cameraTransform: transform,
+                existingKeyframes: textureKeyframes
             )
 
             let inferenceID = UUID()
@@ -431,6 +668,19 @@ public final class ARSessionManager: NSObject, ObservableObject {
                         payload: payload
                     )
 
+                    var capturedKeyframe: CapturedTextureKeyframe?
+                    if textureSlot != nil,
+                       let jpegData = Self.downsampleToJPEGData(pixelBuffer: payload.pixelBuffer) {
+                        capturedKeyframe = CapturedTextureKeyframe(
+                            cameraTransform: payload.cameraTransform,
+                            intrinsics: payload.intrinsics,
+                            imageResolution: payload.imageResolution,
+                            jpegData: jpegData,
+                            timestamp: payload.timestamp,
+                            sectorIndex: Self.sectorIndex(forCameraTransform: payload.cameraTransform)
+                        )
+                    }
+
                     guard !Task.isCancelled else {
                         await self?.finishInference(id: inferenceID)
                         return
@@ -440,6 +690,8 @@ public final class ARSessionManager: NSObject, ObservableObject {
                         detections,
                         payload: payload,
                         isLocalDetector: detector is LocalEquipmentDetector,
+                        capturedKeyframe: capturedKeyframe,
+                        textureSlot: textureSlot,
                         inferenceID: inferenceID
                     )
                 } catch is CancellationError {
@@ -455,10 +707,16 @@ public final class ARSessionManager: NSObject, ObservableObject {
         _ detections: [Detection2D],
         payload: ExtractedFramePayload,
         isLocalDetector: Bool,
+        capturedKeyframe: CapturedTextureKeyframe?,
+        textureSlot: Int?,
         inferenceID: UUID
     ) {
         defer { finishInference(id: inferenceID) }
         guard activeInferenceID == inferenceID else { return }
+
+        if let capturedKeyframe {
+            registerTextureKeyframe(capturedKeyframe, slotIndex: textureSlot)
+        }
 
         let projectionOrientation: CGImagePropertyOrientation = isLocalDetector
             ? payload.imageOrientation
