@@ -1,0 +1,78 @@
+name: VisualMapper3D
+options:
+  bundleIdPrefix: com.visualmapper
+  deploymentTarget:
+    iOS: "17.0"
+
+targets:
+  VisualMapperCore:
+    type: library.static
+    platform: iOS
+    sources:
+      - path: Sources/Models
+      - path: Sources/Services
+      - path: Sources/Views
+    settings:
+      base:
+        PRODUCT_NAME: VisualMapperCore
+        SWIFT_VERSION: "6.0"
+        SWIFT_STRICT_CONCURRENCY: complete
+        CODE_SIGNING_ALLOWED: NO
+        CODE_SIGNING_REQUIRED: NO
+        CODE_SIGN_IDENTITY: ""
+      configs:
+        Debug:
+          ENABLE_TESTABILITY: YES
+
+  VisualMapper3D:
+    type: application
+    platform: iOS
+    sources:
+      - path: Sources/App
+        excludes:
+          - Info.plist
+          - VisualMapper3D.entitlements
+      - path: yolov8s-worldv2.mlpackage
+    dependencies:
+      - target: VisualMapperCore
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.visualmapper.ar3d
+        PRODUCT_NAME: VisualMapper3D
+        INFOPLIST_FILE: Sources/App/Info.plist
+        GENERATE_INFOPLIST_FILE: NO
+        CODE_SIGN_ENTITLEMENTS: Sources/App/VisualMapper3D.entitlements
+        TARGETED_DEVICE_FAMILY: "1"
+        "ARCHS[sdk=iphoneos*]": arm64
+        SWIFT_VERSION: "6.0"
+        SWIFT_STRICT_CONCURRENCY: complete
+        COREML_CODEGEN_LANGUAGE: None
+        MARKETING_VERSION: "1.0.0"
+        CURRENT_PROJECT_VERSION: "1"
+        CODE_SIGNING_ALLOWED: NO
+        CODE_SIGNING_REQUIRED: NO
+        CODE_SIGN_IDENTITY: ""
+      configs:
+        Debug:
+          ENABLE_TESTABILITY: YES
+    scheme:
+      testTargets:
+        - VisualMapper3DTests
+
+  VisualMapper3DTests:
+    type: bundle.unit-test
+    platform: iOS
+    sources:
+      - path: Tests/VisualMapper3DTests
+      - path: yolov8s-worldv2.mlpackage
+    dependencies:
+      - target: VisualMapperCore
+    settings:
+      base:
+        PRODUCT_NAME: VisualMapper3DTests
+        GENERATE_INFOPLIST_FILE: YES
+        SWIFT_VERSION: "6.0"
+        SWIFT_STRICT_CONCURRENCY: complete
+        CODE_SIGNING_ALLOWED: NO
+        CODE_SIGNING_REQUIRED: NO
+        CODE_SIGN_IDENTITY: ""

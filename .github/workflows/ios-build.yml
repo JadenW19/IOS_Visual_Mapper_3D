@@ -1,0 +1,64 @@
+name: iOS Build & Test (Unsigned IPA)
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  build-and-test:
+    runs-on: macos-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install XcodeGen & Generate Xcode Project
+        run: |
+          brew install xcodegen
+          xcodegen generate
+
+      - name: Run Unit Tests (iOS Simulator)
+        run: |
+          SIM_DEST=$(xcrun simctl list devices available | grep -m1 -E "iPhone (1[4-9]|[2-9][0-9]) Pro" | sed -E 's/.*\(([0-9A-F-]+)\).*/id=\1/')
+          if [ -z "$SIM_DEST" ]; then
+            SIM_DEST=$(xcrun simctl list devices available | grep -m1 -E "iPhone " | sed -E 's/.*\(([0-9A-F-]+)\).*/id=\1/')
+          fi
+          if [ -z "$SIM_DEST" ]; then
+            echo "No available iPhone simulator found:"
+            xcrun simctl list devices available
+            exit 1
+          fi
+          echo "Using simulator destination: $SIM_DEST"
+          xcodebuild test \
+            -project VisualMapper3D.xcodeproj \
+            -scheme VisualMapper3D \
+            -configuration Debug \
+            -destination "$SIM_DEST" \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY=""
+
+      - name: Build Unsigned iOS App Bundle
+        run: |
+          xcodebuild build \
+            -project VisualMapper3D.xcodeproj \
+            -scheme VisualMapper3D \
+            -configuration Release \
+            -sdk iphoneos \
+            -destination 'generic/platform=iOS' \
+            -derivedDataPath build/DerivedData \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY=""
+
+      - name: Package Unsigned .ipa
+        run: |
+          APP=build/DerivedData/Build/Products/Release-iphoneos/VisualMapper3D.app
+          mkdir -p build/Payload
+          cp -R "$APP" build/Payload/
+          cd build && zip -qry VisualMapper3D.ipa Payload
+
+      - name: Upload Unsigned .ipa Artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: VisualMapper3D-unsigned-ipa
+          path: build/VisualMapper3D.ipa
