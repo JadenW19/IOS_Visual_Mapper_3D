@@ -233,7 +233,7 @@ public struct ScanCoverageState: Sendable, Equatable {
         sectorPhotoCaptured: [Bool] = Array(repeating: false, count: ScanCoverageState.defaultSectorCount),
         activeHeadingSector: Int = 0,
         capturedKeyframeCount: Int = 0,
-        maxKeyframeCount: Int = 15,
+        maxKeyframeCount: Int = 63,
         overallCoverageFraction: Double = 0.0,
         guidanceHint: String = "Rotate slowly 360° around the room to capture mesh & photos"
     ) {

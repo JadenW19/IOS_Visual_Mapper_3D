@@ -142,12 +142,12 @@ public actor RoomModelBaker {
         let height: Float
     }
 
-    nonisolated private static let atlasCols: Int = 4
-    nonisolated private static let atlasRows: Int = 4
-    nonisolated private static let tileWidth: Int = 512
-    nonisolated private static let tileHeight: Int = 384
-    nonisolated private static let maxAtlasKeyframeTiles: Int = 15
-    nonisolated private static let paletteTileIndex: Int = 15
+    nonisolated private static let atlasCols: Int = 8
+    nonisolated private static let atlasRows: Int = 8
+    nonisolated private static let tileWidth: Int = 256
+    nonisolated private static let tileHeight: Int = 192
+    nonisolated private static let maxAtlasKeyframeTiles: Int = 63
+    nonisolated private static let paletteTileIndex: Int = 63
 
     public init() {}
 
@@ -485,7 +485,7 @@ public actor RoomModelBaker {
         let cam = kf.viewMatrix * SIMD4<Float>(worldPoint.x, worldPoint.y, worldPoint.z, 1.0)
         // ARKit camera frame looks down -Z.
         let depth = -cam.z
-        guard depth.isFinite, depth >= 0.18, depth <= 7.0 else {
+        guard depth.isFinite, depth >= 0.15, depth <= 8.5 else {
             return nil
         }
         let px = kf.fx * (cam.x / depth) + kf.cx
@@ -493,8 +493,8 @@ public actor RoomModelBaker {
         let uRaw = px / kf.width
         let vRaw = py / kf.height
         guard uRaw.isFinite, vRaw.isFinite,
-              uRaw >= 0.015, uRaw <= 0.985,
-              vRaw >= 0.015, vRaw <= 0.985 else {
+              uRaw >= 0.004, uRaw <= 0.996,
+              vRaw >= 0.004, vRaw <= 0.996 else {
             return nil
         }
         return SIMD2<Float>(uRaw, vRaw)
@@ -506,8 +506,8 @@ public actor RoomModelBaker {
     ) -> SIMD2<Float> {
         let col = tileIndex % atlasCols
         let row = tileIndex / atlasCols
-        let padU: Float = 2.0 / Float(atlasCols * tileWidth)
-        let padV: Float = 2.0 / Float(atlasRows * tileHeight)
+        let padU: Float = 1.5 / Float(atlasCols * tileWidth)
+        let padV: Float = 1.5 / Float(atlasRows * tileHeight)
         let tileUSize = 1.0 / Float(atlasCols)
         let tileVSize = 1.0 / Float(atlasRows)
 
@@ -554,10 +554,10 @@ public actor RoomModelBaker {
         for kf in keyframes {
             let toCamera = kf.cameraPosition - centroid
             let worldDist = simd_length(toCamera)
-            guard worldDist >= 0.20, worldDist <= 6.5 else { continue }
+            guard worldDist >= 0.15, worldDist <= 8.5 else { continue }
 
             let facing = simd_dot(unitFaceNormal, toCamera / worldDist)
-            guard facing > 0.12 else { continue }
+            guard facing > 0.03 else { continue }
 
             guard let raw0 = projectPoint(p0, into: kf),
                   let raw1 = projectPoint(p1, into: kf),
@@ -737,9 +737,9 @@ public actor RoomModelBaker {
         for kf in keyframes {
             let toCamera = kf.cameraPosition - centroid
             let worldDist = simd_length(toCamera)
-            guard worldDist >= 0.20, worldDist <= 6.5 else { continue }
+            guard worldDist >= 0.15, worldDist <= 8.5 else { continue }
             let facing = simd_dot(unitFaceNormal, toCamera / worldDist)
-            guard facing > 0.12 else { continue }
+            guard facing > 0.03 else { continue }
 
             guard let r0 = projectPoint(q0, into: kf),
                   let r1 = projectPoint(q1, into: kf),

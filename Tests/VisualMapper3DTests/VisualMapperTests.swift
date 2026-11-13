@@ -1096,13 +1096,13 @@ final class VisualMapperTests: XCTestCase {
         XCTAssertEqual(wallSubmesh.texCoords.count, wallSubmesh.positions.count)
         XCTAssertEqual(wallSubmesh.positions.count, 6)
 
-        // Front-facing triangle UV must land in Tile 0 (col 0: u in 0...0.25, row 0: v in 0.75...1.0).
-        XCTAssertTrue(wallSubmesh.texCoords[0].x >= 0.0 && wallSubmesh.texCoords[0].x <= 0.25)
-        XCTAssertTrue(wallSubmesh.texCoords[0].y >= 0.75 && wallSubmesh.texCoords[0].y <= 1.0)
+        // Front-facing triangle UV must land in Tile 0 (col 0: u in 0...0.125, row 0: v in 0.875...1.0).
+        XCTAssertTrue(wallSubmesh.texCoords[0].x >= 0.0 && wallSubmesh.texCoords[0].x <= 0.125)
+        XCTAssertTrue(wallSubmesh.texCoords[0].y >= 0.875 && wallSubmesh.texCoords[0].y <= 1.0)
 
-        // Behind-camera triangle UV must land in Tile 15 semantic palette (col 3: u in 0.75...1.0, row 3: v in 0...0.25).
-        XCTAssertTrue(wallSubmesh.texCoords[3].x >= 0.75 && wallSubmesh.texCoords[3].x <= 1.0)
-        XCTAssertTrue(wallSubmesh.texCoords[3].y >= 0.0 && wallSubmesh.texCoords[3].y <= 0.25)
+        // Behind-camera triangle UV must land in Tile 63 semantic palette (col 7: u in 0.875...1.0, row 7: v in 0...0.125).
+        XCTAssertTrue(wallSubmesh.texCoords[3].x >= 0.875 && wallSubmesh.texCoords[3].x <= 1.0)
+        XCTAssertTrue(wallSubmesh.texCoords[3].y >= 0.0 && wallSubmesh.texCoords[3].y <= 0.125)
 
         // Interior floor dropout must be filled (> 4 original border triangles).
         let floorSubmesh = try XCTUnwrap(result.geometry.submeshes.first { $0.category == .floor })

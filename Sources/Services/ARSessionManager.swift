@@ -117,7 +117,7 @@ public final class ARSessionManager: NSObject, ObservableObject {
     /// Anchor cap applied immediately when iOS dispatches a low-memory warning.
     public static let memoryWarningMeshAnchorCap: Int = 80
     /// Maximum number of downscaled RGB keyframes kept for post-scan photorealistic atlas baking.
-    nonisolated public static let maxTextureKeyframes: Int = 15
+    nonisolated public static let maxTextureKeyframes: Int = 63
 
     public let session: ARSession
     private var throttlePolicy: KeyframeThrottlePolicy
@@ -369,8 +369,8 @@ public final class ARSessionManager: NSObject, ObservableObject {
         cameraTransform: simd_float4x4,
         existingKeyframes: [CapturedTextureKeyframe],
         maxKeyframes: Int = ARSessionManager.maxTextureKeyframes,
-        minTranslation: Float = 0.35,
-        minRotationDegrees: Float = 22.0
+        minTranslation: Float = 0.25,
+        minRotationDegrees: Float = 15.0
     ) -> Int? {
         guard maxKeyframes > 0 else { return nil }
         let camPos = simd_float3(
@@ -431,11 +431,11 @@ public final class ARSessionManager: NSObject, ObservableObject {
         return nil
     }
 
-    /// Downscales a live camera `CVPixelBuffer` to a compact RGB JPEG buffer (`512×384` default)
-    /// inside an `autoreleasepool` so texture capture adds < 1 MB total memory overhead.
+    /// Downscales a live camera `CVPixelBuffer` to a compact RGB JPEG buffer (`256×192` default)
+    /// inside an `autoreleasepool` so 63 keyframes add < 1 MB total memory overhead.
     nonisolated public static func downsampleToJPEGData(
         pixelBuffer: CVPixelBuffer,
-        targetSize: CGSize = CGSize(width: 512, height: 384),
+        targetSize: CGSize = CGSize(width: 256, height: 192),
         compressionQuality: CGFloat = 0.80
     ) -> Data? {
         guard targetSize.width > 0, targetSize.height > 0 else { return nil }
