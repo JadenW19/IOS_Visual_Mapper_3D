@@ -7,7 +7,7 @@ import simd
 /// transitions when focusing on tracked 3D clinic equipment.
 @MainActor
 public final class CameraFocusController: ObservableObject {
-    public static let defaultVantageOffsetMeters: Float = 0.6
+    nonisolated public static let defaultVantageOffsetMeters: Float = 0.6
 
     @Published public private(set) var focusedItemID: UUID?
     @Published public private(set) var isVirtualCameraActive: Bool = false
