@@ -302,7 +302,12 @@ final class DollhouseSceneCoordinator: ObservableObject {
             for (category, entity) in submeshEntitiesByCategory {
                 let resolvedMaterial: any RealityKit.Material
                 if effectiveMode == .photorealistic, let texture = atlasTexture {
-                    var texturedMat = UnlitMaterial(color: .white, applyPostProcessToneMap: false)
+                    var texturedMat: UnlitMaterial
+                    if #available(iOS 18.0, *) {
+                        texturedMat = UnlitMaterial(color: .white, applyPostProcessToneMap: false)
+                    } else {
+                        texturedMat = UnlitMaterial()
+                    }
                     texturedMat.color = .init(tint: .white, texture: .init(texture))
                     if category == .window || category == .opening {
                         texturedMat.blending = .transparent(opacity: .init(floatLiteral: 0.78))
