@@ -117,7 +117,7 @@ public final class ARSessionManager: NSObject, ObservableObject {
     /// Anchor cap applied immediately when iOS dispatches a low-memory warning.
     public static let memoryWarningMeshAnchorCap: Int = 80
     /// Maximum number of downscaled RGB keyframes kept for post-scan photorealistic atlas baking.
-    public static let maxTextureKeyframes: Int = 15
+    nonisolated public static let maxTextureKeyframes: Int = 15
 
     public let session: ARSession
     private var throttlePolicy: KeyframeThrottlePolicy
